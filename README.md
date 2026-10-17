@@ -1,4 +1,4 @@
-# CAD Automatic WWJ
+﻿# CAD Automatic WWJ
 
 让 AI 智能体真正操作本机 **AutoCAD** 的技能：把一段 JSON 描述画成**真实的 DWG 图纸**、建图层加标注填充、导 DXF 与 PDF、体检已有图纸、出错自动诊断修复 —— 每一步都用读回的真实字节作证据，不靠「命令执行了」这种自述。
 
@@ -349,7 +349,7 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 ### 8.5 图片 → 矢量几何（视觉矢量化）
 
 ```powershell
-& "$s\Get-CadImageInfo.ps1" -Path .\sketch.png -Vectorize -Scale 0.1 -AsJson
+& "$s\Get-CadImageInfo.ps1" -Path .\sketch.png -Action vectorize -Output .\sketch.dxf -Scale 0.1 -AsJson
 ```
 
 管线（`CadVectorize.ps1`）：`Get-CadImageMask`（二值掩码，`darkIsInk` 自动镜像阈值）→ `Get-CadMaskBlobs`（8 邻域 BFS 连通域，扁平下标提速）→ 每个墨团判形状：`Get-CadBlobCircleFit`（径向偏差 ≤0.15 且 36 扇区覆盖 ≥30 双判据）→ `Get-CadBlobLineFit`（PCA 主轴端点，细长度 ≥4）→ 否则 `Get-CadBlobConvexHull`（Andrew 单调链）当闭合多边形 → `Convert-CadImageGeometryToSpec`（Y 翻转 + 缩放 + 图层三分类）→ `Write-CadImageDxf`（直接写 R12 DXF）。
@@ -435,7 +435,7 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 # 1) 单元测试（秒级，不需要 AutoCAD）
-pwsh -File "$s\run-unit-test.ps1"                       # 261 项
+pwsh -File "$s\run-unit-test.ps1"                       # 265 项
 
 # 2) 集成自检（真出图，约 40 秒）
 pwsh -File "$s\run-test.ps1" -Test all                  # 65 项
@@ -447,7 +447,7 @@ pwsh -File "$s\run-scenario-test.ps1" -Mode real        # 3 个，真机
 pwsh -File "$s\run-scenario-test.ps1" -ListScenarios     # 看全部场景
 ```
 
-当前状态：**261 / 261**、**65 / 65**、**15 / 15**、**11 / 11**、**3 / 3**，全绿。
+当前状态：**265 / 265**、**65 / 65**、**15 / 15**、**11 / 11**、**3 / 3**，全绿。
 
 三档模式回答三个不同的问题：
 

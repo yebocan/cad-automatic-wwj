@@ -26,7 +26,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Path,
-    [ValidateSet('info', 'ascii', 'ink', 'compare', 'convert')]
+    [ValidateSet('info', 'ascii', 'ink', 'compare', 'convert', 'vectorize')]
     [string]$Action = 'info',
 
     # ascii
@@ -44,6 +44,11 @@ param(
     [double]$Scale = 0,
     [switch]$NoFlipY,
 
+    # vectorize
+    [string]$Output,
+    [string]$Layer = 'IMAGE',
+    [int]$MinBlobArea = 40,
+
     # compare
     [string]$Actual,
     [int]$Tolerance = 32,
@@ -58,6 +63,9 @@ $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'CadImage.ps1')
+. (Join-Path $scriptDir 'CadEvidence.ps1')  # CadVectorize 用 New-CadEvidence 打证据
+. (Join-Path $scriptDir 'CadVectorize.ps1')
+. (Join-Path $scriptDir 'CadPdf.ps1')   # New-CadDxfText 等 DXF 写盘工具在 CadPdf.ps1 里
 
 $result = [ordered]@{
     action     = $Action
@@ -68,6 +76,7 @@ $result = [ordered]@{
     usable     = $null
     ink        = $null
     ascii      = $null
+    vectorize  = $null
     convert    = $null
     compare    = $null
     diffImage  = $null
@@ -141,6 +150,35 @@ try {
                     topRight    = $c.To($k.bounds.maxX, $k.bounds.minY)
                     topLeft     = $c.To($k.bounds.minX, $k.bounds.minY)
                 }
+            }
+            $result.status = 'ok'
+        }
+
+        'vectorize' {
+            # 图片 → 矢量几何（CadVectorize.ps1 的连通域拟合管线）
+            # 产物：DXF（-Output 必填）+ 内嵌 JSON（circles/lines/polygons + 证据分级）
+            # 结果照抄 Write-CadImageDxf 的报告结构，但把 geometry 与 conv 也带上，
+            # 让调用方（模型）可以直接把 circles/lines 转成正式 spec。
+            $geo = Find-CadImageGeometry -Path $Path -Threshold $Threshold `
+                -DarkIsInk $DarkIsInk -MinBlobArea $MinBlobArea
+            foreach ($gw in $geo.warnings) { $warnings.Add($gw) }
+            $conv = Convert-CadImageGeometryToSpec -Geometry $geo `
+                -Scale $(if ($Scale -gt 0) { $Scale } else { 0.1 }) -IncludePolygons
+            $dxf = Write-CadImageDxf -Geometry $geo -Output $Output `
+                -Scale $(if ($Scale -gt 0) { $Scale } else { 0.1 }) -IncludePolygons
+            $result.vectorize = [ordered]@{
+                output     = $dxf.output
+                bytes      = $dxf.bytes
+                entities   = $dxf.entities
+                extents    = $dxf.extents
+                circles    = @($geo.circles).Count
+                lines      = @($geo.lines).Count
+                polygons   = @($geo.polygons).Count
+                inkCount   = $geo.inkCount
+                darkIsInk  = $geo.darkIsInk
+                evidence   = $geo.evidence
+                warnings   = $conv.warnings
+                specEntities = $conv.spec.entities
             }
             $result.status = 'ok'
         }

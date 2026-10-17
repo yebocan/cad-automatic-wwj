@@ -509,7 +509,17 @@
 
 ⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。
 
-### 图片 → 矢量几何（CadVectorize.ps1，dot-source 库）
+### 图片 → 矢量几何
+
+一条命令版（`Get-CadImageInfo.ps1 -Action vectorize`，推荐）：
+
+```powershell
+.\Get-CadImageInfo.ps1 -Path <图片> -Action vectorize -Output <dxf> [-Scale 0.1] [-MinBlobArea 40] [-AsJson]
+```
+
+报告 `vectorize` 字段：`{output bytes entities extents circles lines polygons inkCount darkIsInk evidence[] warnings[] specEntities[]}`——`specEntities` 是可直接粘进正式 spec 的实体数组（带 `_src` 证据注记），DXF 已同时落盘。
+
+分步版（`CadVectorize.ps1`，dot-source 库，要更细控制时）：
 
 ```powershell
 . .\CadVectorize.ps1

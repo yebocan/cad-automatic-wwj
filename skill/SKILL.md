@@ -1,4 +1,4 @@
----
+﻿---
 name: cad-automatic-wwj
 description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
 ---
@@ -201,7 +201,11 @@ DWG 路径要先把 DWG 转成 DXF 再解析（用 accoreconsole 开图 → `c:S
 ### 图片 → 矢量几何（视觉矢量化）
 
 ```powershell
-& "<skill>\scripts\CadVectorize.ps1"（dot-source 后调用，或用场景测试里的内嵌用法）
+# 一条命令：图片 → DXF + 几何 JSON（evidence 全带上）
+& "<skill>\scripts\Get-CadImageInfo.ps1" -Path "photo.png" -Action vectorize -Output "out.dxf" -Scale 0.1 -AsJson
+
+# 或 dot-source 后分步调（要更细的控制时）
+& "<skill>\scripts\CadVectorize.ps1"
 $geo = Find-CadImageGeometry -Path "photo.png" -MinBlobArea 40
 $conv = Convert-CadImageGeometryToSpec -Geometry $geo -Scale 0.1
 $dxf = Write-CadImageDxf -Geometry $geo -Output "out.dxf" -Scale 0.1
@@ -301,7 +305,7 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 | 用户想看什么 | 命令 | 验收重点 |
 |---|---|---|
 | 真机能不能画、产物对不对 | `run-test.ps1 -Test all` | 13 个实体全部落盘、块定义与块插入都成立、DWG/DXF/PDF 三结构校验通过、DXF 回读实体数与 JSON 声明交叉核对、中文未乱码、退出码 0、无残留进程、五态结论优先级、manifest 自比对与差异检出、PDF 矢量路径转 DXF 落在 MediaBox 内（**65 项**） |
-| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units、位图矢量化管线八函数与 Y 轴翻转（**261 项**） |
+| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units、位图矢量化管线八函数与 Y 轴翻转（**265 项**） |
 | 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **15** / real **3**） |
 
 ```powershell

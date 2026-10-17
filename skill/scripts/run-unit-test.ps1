@@ -1089,6 +1089,13 @@ Check 'Write-CadImageDxf 写 INSUNITS=4' ($vecTxt -match [regex]::Escape('$INSUN
 Check '圆拟合双判据：径向偏差 0.15' ($vecTxt -match 'MaxRadialDevRatio\s*=\s*0\.15') ''
 Check '圆拟合双判据：扇区覆盖 30/36' ($vecTxt -match 'MinSectors\s*=\s*30' -and $vecTxt -match 'SectorCount\s*=\s*36') ''
 
+# 22.10 vectorize CLI 动作（Get-CadImageInfo.ps1 -Action vectorize）
+$gii = Get-Content (Join-Path $PSScriptRoot 'Get-CadImageInfo.ps1') -Raw
+Check 'vectorize CLI: -Action vectorize 在 ValidateSet 里' ($gii -like "*'info', 'ascii', 'ink', 'compare', 'convert', 'vectorize'*") 'Get-CadImageInfo.ps1 param ValidateSet'
+Check 'vectorize CLI: dot-source CadEvidence.ps1（New-CadEvidence 依赖）' ($gii -like "*Join-Path `$scriptDir 'CadEvidence.ps1'*") '缺了会报 term not recognized'
+Check 'vectorize CLI: dot-source CadVectorize.ps1' ($gii -like "*Join-Path `$scriptDir 'CadVectorize.ps1'*") ''
+Check 'vectorize CLI: dot-source CadPdf.ps1（New-CadDxfText）' ($gii -like "*Join-Path `$scriptDir 'CadPdf.ps1'*") ''
+
 # ══════════════════════════════════════════════════════════════════
 #  汇总
 # ══════════════════════════════════════════════════════════════════
