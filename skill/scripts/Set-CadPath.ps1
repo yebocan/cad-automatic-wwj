@@ -1,4 +1,4 @@
-<#
+﻿<#
     Set-CadPath.ps1 — 配置 accoreconsole / acad.exe / COM ProgID 路径
     ────────────────────────────────────────────────────────────────
     写一次，以后所有脚本都不用再传 -AccoreConsole。

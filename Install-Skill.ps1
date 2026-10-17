@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('install', 'update', 'uninstall', 'status')]
     [string]$Action = 'install',
@@ -69,7 +69,14 @@ if ($Action -in @('install', 'update')) {
         'scripts\CadCommon.ps1',
         'scripts\CadCompiler.ps1',
         'scripts\cadcore.lsp',
-        'scripts\Invoke-CadDraw.ps1'
+        'scripts\Invoke-CadDraw.ps1',
+        'scripts\CadEvidence.ps1',
+        'scripts\CadSpecCheck.ps1',
+        'scripts\CadPdf.ps1',
+        'scripts\CadImage.ps1',
+        'scripts\CadVectorize.ps1',
+        'scripts\Test-CadSpec.ps1',
+        'scripts\Convert-CadPdfToDxf.ps1'
     )
     $missing = @()
     foreach ($rel in $mustHave) {

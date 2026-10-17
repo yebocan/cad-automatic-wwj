@@ -1,4 +1,4 @@
-<#
+﻿<#
     fake-accoreconsole.ps1 — 冒充 accoreconsole.exe 的测试替身
     ────────────────────────────────────────────────────────────────
     目的：验证「本 skill 对 accoreconsole 输出的解析」和「产物校验逻辑」，

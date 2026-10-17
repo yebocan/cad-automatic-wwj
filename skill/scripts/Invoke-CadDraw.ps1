@@ -1,4 +1,4 @@
-<#
+﻿<#
     Invoke-CadDraw.ps1 — 从 JSON 图纸描述生成 DWG / DXF / PDF
     ────────────────────────────────────────────────────────────────
     这是本 skill 的主入口。AI 只写 JSON，本脚本负责：
@@ -551,7 +551,14 @@ function Invoke-CadDraw {
         # （确实画出来了），但 disposition 必须是 fail（交出去会把 100mm 当
         # 100m 用）。以前两者都从 failed.Count 推，于是 status=partial 与
         # disposition=fail 同时出现，读报告的人以为「画了一半」。
-        $artifactFailed = @($checks | Where-Object { -not $_.pass -and $_.scope -ne 'verdict' })
+        # $_.scope 是可选字段（只有 verdict 类 check 有）—— StrictMode 下直接
+        # $_.scope 访问不存在的属性会抛「The property 'scope' cannot be found」，
+        # 把整个报告构造炸掉（实测出现过一次：某轮第一个 check 没带 scope）。
+        # 所以统一用 psobject 取，取不到给 $null。
+        $artifactFailed = @($checks | Where-Object {
+            $sc = $_.PSObject.Properties['scope']
+            -not $_.pass -and (-not $sc -or $sc.Value -ne 'verdict')
+        })
         $report.status = if ($artifactFailed.Count -eq 0) { 'ok' } elseif ($doneMarker) { 'partial' } else { 'failed' }
         # error 里要把验收类失败也写上：status=ok 但 disposition=fail 时，
         # 用户看到 advice 让他「先看 error」，error 却是空的就自相矛盾了。

@@ -346,6 +346,16 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 ⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。
 
+### 8.5 图片 → 矢量几何（视觉矢量化）
+
+```powershell
+& "$s\Get-CadImageInfo.ps1" -Path .\sketch.png -Vectorize -Scale 0.1 -AsJson
+```
+
+管线（`CadVectorize.ps1`）：`Get-CadImageMask`（二值掩码，`darkIsInk` 自动镜像阈值）→ `Get-CadMaskBlobs`（8 邻域 BFS 连通域，扁平下标提速）→ 每个墨团判形状：`Get-CadBlobCircleFit`（径向偏差 ≤0.15 且 36 扇区覆盖 ≥30 双判据）→ `Get-CadBlobLineFit`（PCA 主轴端点，细长度 ≥4）→ 否则 `Get-CadBlobConvexHull`（Andrew 单调链）当闭合多边形 → `Convert-CadImageGeometryToSpec`（Y 翻转 + 缩放 + 图层三分类）→ `Write-CadImageDxf`（直接写 R12 DXF）。
+
+实测（PS5.1）：300×300 圆环+线 461ms，圆心偏差 0.018、线长 259 ✓；正方形/弧正确拒绝当圆；空白图给明确警告。产物是「候选几何」：circle/line 记 `known`，polygon 记 `inferred`（齿轮、文字会被当多边形/小墨点丢弃）—— **最终 spec 仍要人确认**，详见 `skill\SKILL.md` 的「图片→矢量几何」节。
+
 ## 9. 如何自动修复
 
 ```powershell
@@ -425,26 +435,26 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 # 1) 单元测试（秒级，不需要 AutoCAD）
-pwsh -File "$s\run-unit-test.ps1"                       # 240 项
+pwsh -File "$s\run-unit-test.ps1"                       # 261 项
 
-# 2) 集成自检（真出图，约 20 秒）
+# 2) 集成自检（真出图，约 40 秒）
 pwsh -File "$s\run-test.ps1" -Test all                  # 65 项
 
 # 3) 场景测试（三档）
-pwsh -File "$s\run-scenario-test.ps1" -Mode offline     # 14 个，纯编译校验
+pwsh -File "$s\run-scenario-test.ps1" -Mode offline     # 15 个，纯编译校验
 pwsh -File "$s\run-scenario-test.ps1" -Mode mock        # 11 个，坏路径注入
 pwsh -File "$s\run-scenario-test.ps1" -Mode real        # 3 个，真机
 pwsh -File "$s\run-scenario-test.ps1" -ListScenarios     # 看全部场景
 ```
 
-当前状态：**240 / 240**、**65 / 65**、**14 / 14**、**11 / 11**、**3 / 3**，全绿。
+当前状态：**261 / 261**、**65 / 65**、**15 / 15**、**11 / 11**、**3 / 3**，全绿。
 
 三档模式回答三个不同的问题：
 
 | 模式 | 数量 | 证明什么 | **不能**证明什么 |
 |---|---|---|---|
 | `mock` | 11 | 脚本对 accoreconsole 输出的**解析与判定**是对的 | 真机行为 |
-| `offline` | 14 | 编译与预检逻辑、编码、PDF/DXF 解析、清单比对 | 任何真机交互 |
+| `offline` | 15 | 编译与预检逻辑、编码、PDF/DXF 解析、图片矢量化、清单比对 | 任何真机交互 |
 | `real` | 3 | 真 accoreconsole 全链路 | 别的机器/别的 AutoCAD 版本 |
 
 `-Mode mock` 用一个假的 `accoreconsole` 注入坏路径（无产物、无 `@@DONE@@`、LISP 报错、图找不到、坏 DXF、坏 PDF、弹对话框、卡死），证明**判定逻辑本身**是有效的。
@@ -478,6 +488,7 @@ cad-automatic-wwj/
       ├─ CadSpecCheck.ps1         出图前 spec 预检
       ├─ CadPdf.ps1               PDF 内容流解析 → DXF
       ├─ CadImage.ps1             图片像素与墨迹分析
+      ├─ CadVectorize.ps1         图片 → 矢量几何（连通域 + 圆/线/多边形拟合）
       ├─ cadcore.lsp              LISP 命令库（51 个 c:XXX）
       ├─ Invoke-CadDraw.ps1       出图主入口
       ├─ Invoke-CadInspect.ps1    体检

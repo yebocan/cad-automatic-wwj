@@ -1,4 +1,4 @@
-<#
+﻿<#
     CadCommon.ps1 — cad-automatic-wwj 公共库
     ────────────────────────────────────────────────────────────────
     所有脚本都 dot-source 这个文件。它只提供函数，不做任何动作。
@@ -388,6 +388,32 @@ function Invoke-CadCoreConsole {
         $registered = Register-OwnedCadProcess -Process $proc -Kind 'accoreconsole' -Source $exe.path
 
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            # ★ WaitForExit(ms) 的竞态 ★
+            #   进程恰好在超时边缘退出时，这个重载可能返回 false 但进程其实
+            #   已经退出（exit code 已可读）。直接判 timedOut 会把一次成功的
+            #   运行误判成超时 —— 实测快速完成的图上出现过（9.7 秒完成、
+            #   @@DONE@@ 都打出来了，却报 exitCode=(timeout)）。
+            #   所以这里再给 2 秒宽限轮询，确认真的没退出才算超时。
+            $grace = 0
+            while (-not $proc.HasExited -and $grace -lt 20) {
+                Start-Sleep -Milliseconds 100
+                $grace++
+            }
+        }
+        if ($proc.HasExited) {
+            # ★ PS5.1 Start-Process 的 ExitCode=null 怪癖 ★
+            #   带 -RedirectStandardOutput/-RedirectStandardError 时，WaitForExit
+            #   正常返回、HasExited=True，$proc.ExitCode 仍可能是 null
+            #   （最小复现：cmd /c exit 5 → exit=[]）。修法：用 Get-Process -Id
+            #   拿一个「新鲜」对象再读；还不行就按 0 处理并打 warning —— 此时
+            #   stdout 里有没有 @@DONE@@ 才是成败的真正判据。
+            $exitCode = $proc.ExitCode
+            if ($null -eq $exitCode) {
+                $fresh = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+                if ($fresh) { try { $exitCode = $fresh.ExitCode } catch { } }
+            }
+            if ($null -eq $exitCode) { $exitCode = 0 }
+        } else {
             $timedOut = $true
             # ★ 只 Kill 父进程会留孤儿 ★
             #   实测：mock 的 cmd 包装器派生 pwsh 后，$proc.Kill() 只杀掉 cmd.exe，
@@ -407,8 +433,7 @@ function Invoke-CadCoreConsole {
                 $alive = Get-Process -Id $childId -ErrorAction SilentlyContinue
                 if ($alive) { try { Stop-Process -Id $childId -Force -ErrorAction Stop } catch { } }
             }
-        } else {
-            $exitCode = $proc.ExitCode
+            $exitCode = $null
         }
     } catch {
         throw "启动 accoreconsole 失败: $($_.Exception.Message)"

@@ -35,6 +35,9 @@
 | `CadSpecCheck.ps1` | 出图前 spec 预检 |
 | `CadPdf.ps1` | PDF 内容流解析与 DXF 写出 |
 | `CadImage.ps1` | 图片像素与墨迹分析 |
+| `CadVectorize.ps1` | 位图 → 矢量几何（连通域拟合，替代 OpenCV Hough） |
+
+⚠️ **所有含中文的 `.ps1` 必须 UTF-8 带 BOM**——PowerShell 5.1 按 ANSI 读无 BOM 文件，中文注释里的 UTF-8 续字节会被当成 GBK 前导字节，吞掉后面的引号/括号，报 ParserError 而行号全指向注释。`edit`/`write` 工具写文件不保证保留 BOM，改过之后必须重新补（`[IO.File]::WriteAllText($p, $txt, (New-Object System.Text.UTF8Encoding($true)))`），且注意别叠加成双 BOM（`EF BB BF EF BB BF`，PS5.1 会把第二个 BOM 字符当正文，块注释直接失效）。
 
 ⚠️ **库文件绝不能有顶层 `[CmdletBinding()] param(...)`**。dot-source 带 Mandatory param 的库时 PowerShell 会按强制参数绑定，症状是调用方明明传了 `-Path` 却报「缺少一个或多个必需参数: Path」。
 
@@ -506,6 +509,23 @@
 
 ⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。
 
+### 图片 → 矢量几何（CadVectorize.ps1，dot-source 库）
+
+```powershell
+. .\CadVectorize.ps1
+$geo  = Find-CadImageGeometry -Path <图片> [-MinBlobArea 40] [-Threshold 200] [-DarkIsInk <bool>]
+$conv = Convert-CadImageGeometryToSpec -Geometry $geo [-Scale 0.1] [-KnownWidth <mm>] `
+            [-CircleLayer IMAGE_CIRCLE] [-LineLayer IMAGE_LINE] [-PolyLayer IMAGE_POLY] [-MaxPolyPoints 24] [-IncludePolygons]
+$dxf  = Write-CadImageDxf -Geometry $geo -Output <dxf> [-Scale 0.1] [-KnownWidth <mm>] [-IncludePolygons]
+```
+
+管线：`Get-CadImageMask`（bool[] 掩码 + darkInk 镜像阈值）→ `Get-CadMaskBlobs`（8 邻域 BFS 连通域，pixels=y*w+x 扁平下标）→ 逐域判定：`Get-CadBlobCircleFit`（径向偏差 ≤0.15 + 36 扇区覆盖 ≥30，**线宽无关**双判据）、`Get-CadBlobLineFit`（PCA 细长度 ≥4）、`Get-CadBlobConvexHull`（Andrew 单调链）→ `Find-CadImageGeometry` 汇总。
+
+- `Find-CadImageGeometry` 返回 `{width height darkIsInk inkCount inkRatio bounds circles[] lines[] polygons[] blobs evidence[] warnings[]}`；circles/lines 证据 `known`，polygons 证据 `inferred`（只给最小外框，需人工确认）。
+- 产物是 R12 DXF（AC1009，`$INSUNITS=4`），LINE/CIRCLE/POLYLINE 三类实体；`$dxf` 返回 `{output bytes entities scale counts extents warnings}`。
+- **Y 轴必须翻**（内部已处理，`height - 1 - y`）；不知道比例时给 `-Scale 1.0` 会 warning「没有物理比例」，知道实长用 `-KnownWidth`。
+- 只输出 circle / line / polyline 三类。hatch/block/spline/gear 不猜——猜错比不猜更糟。
+
 ---
 
 ## 11. 结论分级与清单复现（CadEvidence.ps1）
@@ -619,9 +639,9 @@ $diff = Compare-CadManifest -Before $back -After $man
 .\run-unit-test.ps1 [-WorkDirectory <dir>]
 ```
 
-**不需要 AutoCAD**，只测纯逻辑。**240 项，约 10 秒**。
+**不需要 AutoCAD**，只测纯逻辑。**261 项，约 10 秒**。
 
-21 个分区：
+22 个分区：
 
 | # | 分区 | 内容 |
 |---|---|---|
@@ -646,6 +666,7 @@ $diff = Compare-CadManifest -Before $back -After $man
 | 19 | 单位与必需图层 | `Get-CadUnitCode` 中文别名、`Get-CadDrawingUnits`、`Test-CadUnits`、图层三分类、`Get-CadExtentSize` |
 | 20 | 出图前 spec 预检 | 负半径/宽 0/坐标爆表/重复 id/constraints/四份官方示例 |
 | 21 | 编译器接入 units | `mm`→`(cadunits 4)`、`m`→`(cadunits 6)`、缺/非法 units 的 warning |
+| 22 | 位图矢量化 | 四库 BOM 非、darkInk 口径、单元素数组逗号、无 if 表达式传参、8 函数存在、Y 翻转、三类输出、DXF 铁律、双判据阈值 |
 
 ---
 
@@ -668,7 +689,7 @@ $diff = Compare-CadManifest -Before $back -After $man
 | 模式 | 数量 | 证明什么 | **不能**证明什么 |
 |---|---|---|---|
 | `mock` | 11 | 脚本对 accoreconsole 输出的**解析与判定**是对的 | 真机行为 |
-| `offline` | 14 | 编译与预检逻辑、编码、PDF/DXF 解析、清单比对 | 任何真机交互 |
+| `offline` | 15 | 编译与预检逻辑、编码、PDF/DXF 解析、图片预检与矢量化、清单比对 | 任何真机交互 |
 | `real` | 3 | 真 accoreconsole 全链路 | 别的机器/别的 AutoCAD 版本 |
 
 `mock` 模式用一个 `mock\fake-accoreconsole.ps1` 冒充 accoreconsole，按预置脚本吐 stdout、写产物、给退出码，含 `no-artifact` / `bad-pdf` / `no-done` / `lisp-error` / `dialog` / `hang` 等场景。`hang` 场景带自保：父进程一死就退，不会留下 `Start-Sleep 3600` 的孤儿。

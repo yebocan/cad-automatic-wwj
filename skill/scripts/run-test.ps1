@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     cad-automatic-wwj 集成自检 —— 真实调用 accoreconsole，逐项断言产物。
 

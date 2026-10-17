@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     PDF 矢量路径解析与 DXF 写出（纯 PowerShell，无第三方依赖）。

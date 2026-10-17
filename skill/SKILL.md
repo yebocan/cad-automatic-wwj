@@ -198,6 +198,24 @@ DWG 路径要先把 DWG 转成 DXF 再解析（用 accoreconsole 开图 → `c:S
 
 ⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。循环内部只做算术。
 
+### 图片 → 矢量几何（视觉矢量化）
+
+```powershell
+& "<skill>\scripts\CadVectorize.ps1"（dot-source 后调用，或用场景测试里的内嵌用法）
+$geo = Find-CadImageGeometry -Path "photo.png" -MinBlobArea 40
+$conv = Convert-CadImageGeometryToSpec -Geometry $geo -Scale 0.1
+$dxf = Write-CadImageDxf -Geometry $geo -Output "out.dxf" -Scale 0.1
+```
+
+[CadVectorize.ps1](scripts/CadVectorize.ps1) 用「连通域 + 拟合」替代 OpenCV 的 Hough 变换（本机无 Python；Hough 要 O(墨点数×角度数) 投票，1600×1200 在 PowerShell 里要几十秒，实测连通域路线 300×300 只要 0.5 秒）。管线四步：墨迹掩码（自动判断深底/浅底）→ 8 邻域 BFS 连通域 → 逐域判定 → 像素坐标翻 Y 轴转图纸坐标。三个判据都是**线宽无关**的：圆用最大径向偏差/平均半径 ≤ 0.15（圆≈0.05、正方形≈0.41，一眼分开）+ 36 个 10° 扇区覆盖 ≥30 个（防把 270° 圆弧当整圆）；线用细长度 `sqrt(λmax/λmin)` ≥ 4（PCA 主成分端点）；其余给 Andrew 单调链凸包（诚实的最小外框，不假装知道内凹形状）。
+
+**诚实边界（写进源码注释，不是免责声明，是能力声明）**：
+
+- 这是视觉矢量化不是语义理解：文字会被当成小墨点丢掉、齿轮变成一坨闭合多边形。产物是「候选几何」+ 证据分级（circle/line 是 `known`，polygons 是 `inferred` 需人工确认），**最终 spec 仍要人确认后再画**——从位图反推精确几何一定要确认，半径差 0.3mm 屏幕上一样、装到机器上就装不进。
+- 只输出 circle / line / polyline 三类，hatch/block/spline/gear 不猜——猜错比不猜更糟。
+- **Y 轴必须翻**：像素 y 向下增、图纸 y 向上增，不翻则上下颠倒且不报错。
+- `-Scale` 不给就按 1:1 并 warning「没有物理比例」；知道图里某条线实际长度时传 `-KnownWidth` 换算。
+
 ## 出图前 spec 预检
 
 ```powershell
@@ -283,8 +301,8 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 | 用户想看什么 | 命令 | 验收重点 |
 |---|---|---|
 | 真机能不能画、产物对不对 | `run-test.ps1 -Test all` | 13 个实体全部落盘、块定义与块插入都成立、DWG/DXF/PDF 三结构校验通过、DXF 回读实体数与 JSON 声明交叉核对、中文未乱码、退出码 0、无残留进程、五态结论优先级、manifest 自比对与差异检出、PDF 矢量路径转 DXF 落在 MediaBox 内（**65 项**） |
-| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units（**240 项**） |
-| 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **14** / real **3**） |
+| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units、位图矢量化管线八函数与 Y 轴翻转（**261 项**） |
+| 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **15** / real **3**） |
 
 ```powershell
 & "<skill>\scripts\run-test.ps1"          -Test all -OutputDirectory "D:\some\writable\dir"
@@ -300,7 +318,7 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 
 - **`real`** 真跑 accoreconsole。慢，但验证的是真机行为。
 - **`mock`** 用 [scripts/mock/fake-accoreconsole.cmd](scripts/mock/fake-accoreconsole.cmd) 冒充。它不猜产物路径，而是**读调用方真正生成的 `.scr` 和 `.lsp`**，从中抠出 `c:SAVEAS`/`c:SAVEDXF`/`c:PLOTPDF` 的目标路径再往那儿写产物——所以改脚本时 mock 不用跟着改。`MOCK_SCENARIO` 环境变量控制十种场景：`normal` / `lisp-error` / `not-found` / `no-done` / `no-artifact` / `same-handle` / `dialog` / `hang` / `bad-dxf` / `bad-pdf`。
-- **`offline`** 完全不执行进程，只验编译、参数校验、单位与图层分类、清单比对、PDF 矢量解析、图片预检。
+- **`offline`** 完全不执行进程，只验编译、参数校验、单位与图层分类、清单比对、PDF 矢量解析、图片预检、图片矢量化（连通域拟合管线）。
 
 **判定标准**
 

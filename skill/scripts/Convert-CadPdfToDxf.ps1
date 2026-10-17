@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     把矢量 PDF 的线稿转成 DXF（CLI 包装，逻辑在 CadPdf.ps1）。

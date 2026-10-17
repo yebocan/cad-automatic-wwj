@@ -1,4 +1,4 @@
-<#
+﻿<#
     run-unit-test.ps1 — 离线单元测试
     ────────────────────────────────────────────────────────────────
     全部使用临时目录里的合成数据，**不启动任何 CAD 进程**，
@@ -31,6 +31,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CadCompiler.ps1')
 . (Join-Path $PSScriptRoot 'CadEvidence.ps1')
 . (Join-Path $PSScriptRoot 'CadSpecCheck.ps1')
+. (Join-Path $PSScriptRoot 'CadImage.ps1')
+. (Join-Path $PSScriptRoot 'CadPdf.ps1')
+. (Join-Path $PSScriptRoot 'CadVectorize.ps1')
 
 $scriptRoot = $PSScriptRoot
 $work = [IO.Path]::GetFullPath($WorkDirectory)
@@ -374,7 +377,7 @@ Check '最小 DXF 结构有效' $chk.valid "valid=$($chk.valid) reason=$($chk.re
 
 $ents = Get-CadDxfEntities -Path $dxfPath
 Check 'DXF 实体数正确' (@($ents).Count -eq 2) "got=$(@($ents).Count)"
-Check 'DXF 实体类型识别' ((@($ents) | Where-Object { $_.type -eq 'LINE' }).Count -eq 1) ''
+Check 'DXF 实体类型识别' (@(@($ents) | Where-Object { $_.type -eq 'LINE' }).Count -eq 1) ''
 
 # 缺 ENTITIES 段必须判定无效
 $badDxf = Join-Path $work 'bad.dxf'
@@ -1043,6 +1046,48 @@ Check '缺 units → 不生成 cadunits 但有 warning' ($cuNone.lisp -notmatch 
 $uSpecBogus = @{ units = 'furlong'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }) }
 $cuBogus = Compile-CadSpec -Spec $uSpecBogus -CoreLspPath 'D:\deepseek harness gongzuoqu\cad-automatic-wwj\skill\scripts\cadcore.lsp'
 Check '非法 units → 不生成 cadunits 且有 warning' ($cuBogus.lisp -notmatch '\(cadunits ' -and ($cuBogus.warnings -join ' ') -match 'furlong') "warnings=$($cuBogus.warnings -join ' | ')"
+
+# ══════════════════════════════════════════════════════════════════
+Section '22. 位图矢量化：CadVectorize（PS5.1 兼容铁律）'
+# ══════════════════════════════════════════════════════════════════
+
+# 22.1 BOM 在且非双 BOM（PS5.1 按 ANSI 读无 BOM UTF-8 会吞引号，见 troubleshooting）
+foreach ($f in @('CadVectorize.ps1', 'CadCommon.ps1', 'CadImage.ps1', 'CadPdf.ps1')) {
+    $fp = Join-Path $scriptRoot $f
+    $b = [IO.File]::ReadAllBytes($fp)
+    $bom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+    $dbl = ($b.Length -ge 6 -and $bom -and $b[3] -eq 0xEF -and $b[4] -eq 0xBB -and $b[5] -eq 0xBF)
+    Check "BOM 存在且非双 BOM：$f" ($bom -and -not $dbl) ("first6=" + (($b[0..5] | ForEach-Object { $_.ToString('X2') }) -join ' '))
+}
+
+# 22.2 darkInk 口径与 Get-CadImageInk 一致（亮图 → 暗是墨）
+$vecTxt = [IO.File]::ReadAllText((Join-Path $scriptRoot 'CadVectorize.ps1'))
+Check 'darkInk 口径与 Get-CadImageInk 一致' ($vecTxt -match 'else \{ \$mean -ge 110 \}') 'Get-CadImageMask 必须与 Get-CadImageInk 同口径，否则白图被判全墨'
+
+# 22.3 单元素数组退化保护
+Check 'Get-CadMaskBlobs 返回数组用一元逗号' ($vecTxt -match 'return ,@\(') 'PS5.1 单元素 Sort-Object 退化成标量，$blobs.Count 报找不到属性'
+
+# 22.4 不使用 if 表达式传参（PS5.1）
+Check 'LAYER 颜色不使用 if 表达式传参' ($vecTxt -notmatch 'New-CadDxfText \$sb 62 \(if ') 'PS7 专属写法在 powershell.exe 下报 if 未识别'
+
+# 22.5 关键函数存在
+foreach ($fn in @('Get-CadImageMask','Get-CadMaskBlobs','Get-CadBlobCircleFit','Get-CadBlobLineFit','Get-CadBlobConvexHull','Find-CadImageGeometry','Convert-CadImageGeometryToSpec','Write-CadImageDxf')) {
+    Check "函数存在：$fn" ($vecTxt -match ('function\s+' + [regex]::Escape($fn))) ''
+}
+
+# 22.6 Y 轴翻转（不翻则上下颠倒且不报错）
+Check 'Convert-CadImageGeometryToSpec 做 Y 轴翻转' ($vecTxt -match 'height - 1 - ') '像素 y 向下增，图纸 y 向上增'
+
+# 22.7 诚实边界：只出三类，不猜语义
+Check '只输出 circle/line/polyline 三类' ($vecTxt -match '只输出 circle / line / polyline') ''
+
+# 22.8 DXF 铁律
+Check 'Write-CadImageDxf 写 AC1009' ($vecTxt -match "'AC1009'") ''
+Check 'Write-CadImageDxf 写 INSUNITS=4' ($vecTxt -match [regex]::Escape('$INSUNITS') -and $vecTxt -like '*New-CadDxfText*70 ''4''*') ''
+
+# 22.9 圆拟合双判据（径向偏差 + 角度覆盖）
+Check '圆拟合双判据：径向偏差 0.15' ($vecTxt -match 'MaxRadialDevRatio\s*=\s*0\.15') ''
+Check '圆拟合双判据：扇区覆盖 30/36' ($vecTxt -match 'MinSectors\s*=\s*30' -and $vecTxt -match 'SectorCount\s*=\s*36') ''
 
 # ══════════════════════════════════════════════════════════════════
 #  汇总

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     cad-automatic-wwj 场景测试 —— 验「出错时脚本怎么判」，而不是「真机能跑吗」。
 
@@ -80,6 +80,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'CadSpecCheck.ps1')
 . (Join-Path $PSScriptRoot 'CadPdf.ps1')
 . (Join-Path $PSScriptRoot 'CadImage.ps1')
+. (Join-Path $PSScriptRoot 'CadVectorize.ps1')
 
 $drawScript = Join-Path $PSScriptRoot 'Invoke-CadDraw.ps1'
 $inspectScript = Join-Path $PSScriptRoot 'Invoke-CadInspect.ps1'
@@ -288,6 +289,15 @@ $scenarios = @(
         expect  = 'stats'
         assert  = '必须给出尺寸、格式、空白比例、暗点计数，并对纯白图与过小图给出可操作的警告'
         timeout = 60
+    }
+    [pscustomobject]@{
+        name    = 'offline-vectorize'
+        title   = '位图矢量化：连通域拟合出圆/线/多边形'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'geometry'
+        assert  = '圆环拟合出圆且偏差小、正方形不得判圆、空白图必须明确说没有墨迹；DXF 落盘且实体数对'
+        timeout = 120
     }
 )
 
@@ -901,6 +911,72 @@ function Invoke-OfflineScenario {
                 -Passed ($dimsOk -and $fmtOk -and $blankOk -and $darkOk -and $boundsOk -and $warnOk -and $missingOk -and [bool]$tinyOk) `
                 -Expected '尺寸/格式正确；墨迹比与墨点数区分有线稿与纯白；有线稿有包围盒；纯白/过小/不可读都判定不可用并给理由' `
                 -Actual "dims=$dimsOk fmt=$fmtOk ink=$blankOk($whiteRatio/$lineRatio) px=$darkOk($iw.inkPixels/$il.inkPixels) bounds=$boundsOk 白图不可用=$warnOk 不可读=$missingOk tiny=$tinyOk"
+        }
+        'offline-vectorize' {
+            # 位图矢量化端到端：与 _tmp\vectest.ps1 同一套 fixture，
+            # 但收窄到「圆拟合、拒绝假圆、空白诚实报错、DXF 落盘」四个断言。
+            $vd = Join-Path $Dir 'vec'
+            New-Item -ItemType Directory -Path $vd -Force | Out-Null
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+
+            function New-VecFlat {
+                param([int]$W, [int]$H)
+                $b = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+                $g = [System.Drawing.Graphics]::FromImage($b)
+                $g.Clear([System.Drawing.Color]::White)
+                $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+                return @{ bmp = $b; g = $g }
+            }
+
+            # fixture A：圆环（c=150,150 r=60 线宽 2）+ 水平线
+            $A = New-VecFlat 300 300
+            $black = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::Black)
+            $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+            $A.g.FillEllipse($black, 149, 149, 122, 122)
+            $A.g.FillEllipse($white, 151, 151, 118, 118)
+            $A.g.FillRectangle($black, 20, 79, 260, 2)
+            $A.g.Dispose()
+            $aPath = Join-Path $vd 'a.png'
+            $A.bmp.Save($aPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $A.bmp.Dispose()
+
+            # fixture B：正方形四边（不得判成圆）
+            $B = New-VecFlat 300 300
+            $B.g.FillRectangle($black, 60, 60, 180, 4)
+            $B.g.FillRectangle($black, 60, 236, 180, 4)
+            $B.g.FillRectangle($black, 60, 60, 4, 180)
+            $B.g.FillRectangle($black, 236, 60, 4, 180)
+            $B.g.Dispose()
+            $bPath = Join-Path $vd 'b.png'
+            $B.bmp.Save($bPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $B.bmp.Dispose()
+
+            # fixture D：空白
+            $D = New-VecFlat 200 200
+            $D.g.Dispose()
+            $dPath = Join-Path $vd 'd.png'
+            $D.bmp.Save($dPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $D.bmp.Dispose()
+
+            $ga = Find-CadImageGeometry -Path $aPath -MinBlobArea 40
+            $gb = Find-CadImageGeometry -Path $bPath -MinBlobArea 40
+            $gd = Find-CadImageGeometry -Path $dPath -MinBlobArea 40
+
+            $nc = @($ga.circles).Count; $nl2 = @($ga.lines).Count
+            $circleOk = ($nc -eq 1 -and $nl2 -eq 1 -and [double]$ga.circles[0].radialDev -lt 0.05)
+            $sqOk = (@($gb.circles).Count -eq 0 -and @($gb.polygons).Count -ge 1)
+            $emptyOk = ([int]$gd.inkCount -eq 0 -and @($gd.warnings).Count -gt 0)
+
+            # DXF 落盘 + 结构校验
+            $dxfPath = Join-Path $vd 'out.dxf'
+            $dxf = Write-CadImageDxf -Geometry $ga -Output $dxfPath -Scale 0.1
+            $dxfOk = ((Get-Item -LiteralPath $dxfPath).Length -gt 512 -and [int]$dxf.entities -eq 2)
+            $validOk = (Test-CadDxfFile -Path $dxfPath).valid
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed ($circleOk -and $sqOk -and $emptyOk -and $dxfOk -and $validOk) `
+                -Expected '圆环→1圆(偏差<0.05)+1线；正方形→0圆+≥1多边形；空白→0墨+有警告；DXF 2实体且结构有效' `
+                -Actual "circle=$circleOk(dev=$($ga.circles[0].radialDev) n=$nc/$nl2) square=$sqOk empty=$emptyOk dxf=$dxfOk(valid=$validOk bytes=$($dxf.bytes))"
         }
 
         default {
