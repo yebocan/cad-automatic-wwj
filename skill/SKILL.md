@@ -1,4 +1,4 @@
-﻿---
+---
 name: cad-automatic-wwj
 description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
 ---
@@ -13,6 +13,8 @@ description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动�
 
 - **"画个图 / 生成图纸 / 按这个尺寸画"**：走出图层，用 [scripts/Invoke-CadDraw.ps1](scripts/Invoke-CadDraw.ps1)。喂一份 JSON 描述（格式见 [references/spec.md](references/spec.md)），拿回 DWG/DXF/PDF。
 - **"这张图里有什么 / 有几个圆 / 什么图层 / 尺寸多大"**：走出图体检层，用 [scripts/Invoke-CadInspect.ps1](scripts/Invoke-CadInspect.ps1)。DXF 直接解析，DWG 先转 DXF 再解析。**不要只按文件大小猜内容。**
+- **"把这张已有图纸重画出来 / 从 DWG 反推 spec"**：走逆向重建层，两步：先用 [scripts/Get-CadDwgSpecFingerprint.ps1](scripts/Get-CadDwgSpecFingerprint.ps1) 提取指纹（实体统计/图层/文字/圆线几何），再用 [scripts/Invoke-CadSpecFromDwg.ps1](scripts/Invoke-CadSpecFromDwg.ps1) 编译成 spec JSON 骨架，交给 Invoke-CadDraw 重画。**骨架不是重建完成：`needsReview` 不为空就必须逐项人工确认后才能交付。**
+- **"重画得像不像 / 重建结果和源图对不对"**：走比对层，用 [scripts/Invoke-CadVisualCompare.ps1](scripts/Invoke-CadVisualCompare.ps1)。几何模式（-ReferenceDxf）逐实体比坐标，是 known 级证据；像素模式（-ReferenceImage + -Preview）只回答"像不像"，是 inferred 级证据，**不能当尺寸精确的证明**。
 - **"转成 DXF / 要 R12 给老机器用"**：用 [scripts/Export-CadToDxf.ps1](scripts/Export-CadToDxf.ps1)。导完会核对文件里实际的 `$ACADVER`，不符会写 warning 而不是假装成功。
 - **"导成 PDF / 打印 / 出图给客户"**：用 [scripts/Invoke-CadPlot.ps1](scripts/Invoke-CadPlot.ps1)。产物会过 `%PDF` 头 + `%%EOF` + 页数三重校验。
 - **"画是画出来了但有毛病 / 文件 0 字节 / 打不开"**：走出图修复层，用 [scripts/Invoke-CadRepair.ps1](scripts/Invoke-CadRepair.ps1)。先 `-DryRun` 看诊断，再决定修不修。
@@ -149,6 +151,30 @@ DWG 路径要先把 DWG 转成 DXF 再解析（用 accoreconsole 开图 → `c:S
 ⚠️ **产物存在与否不改变结论档位**——`error` + 有半成品仍然只是 `fail`，不会升级成 `blocked`。产物在不在只影响调用方能不能救回半成品。
 
 **清单复现**（`New-CadManifest` / `Write-CadManifest` / `Compare-CadManifest`）回答「这两次跑出来的是不是同一张图」。只比稳定的字段：`specSha256`、`cadCoreSha256`、`units.code`、`entityCount`、`artifacts[].sha256`（按 `kind` 对齐）。**不比** `timestamp`、路径、`disposition`。两个哈希是 `New-CadManifest` 自己从 `$SpecFile` 与 `cadcore.lsp` 现算的——传不传都会算，读不到就给 `$null` 让比对判差异，**绝不填假哈希**（假哈希会让 `identical=true` 变成谎言）。
+
+## 逆向重建层（已有图纸 → spec → 重画）
+
+```powershell
+$s = "<skill>\scripts"
+
+# 第 1 步：指纹提取（DWG/DXF → 结构报告 JSON）
+& "$s\Get-CadDwgSpecFingerprint.ps1" -Path source.dwg -Output fp.json
+
+# 第 2 步：指纹 → spec 骨架
+& "$s\Invoke-CadSpecFromDwg.ps1" -Fingerprint fp.json -Output rebuilt.json
+
+# 第 3 步：重画
+& "$s\Invoke-CadDraw.ps1" -SpecFile rebuilt.json -OutputDir out
+
+# 第 4 步：比对重建结果和源图
+& "$s\Invoke-CadVisualCompare.ps1" -Dxf out\rebuilt.dxf -ReferenceDxf source.dxf
+```
+
+`Get-CadDwgSpecFingerprint.ps1`：`-Path`（必填）、`-Output`（JSON 报告路径）、`-MaxEntities`（默认 2000）、`-AsJson`。报告核心是 `fingerprint` 对象：`entityCount` / `typeStats` / `layerStats` / `blockDefs` / `inserts` / `textStyles` / `texts`（内容+坐标）/ `dims` / `circles` / `lines` / `arcs` / `polylines`，末尾 `fingerprint` 是「类型分布+图层+文字」拼出的 SHA-256 摘要——两张图摘要一致大概率同一张图。DWG 输入走与 Inspect 相同的 accoreconsole 转换通道。
+
+`Invoke-CadSpecFromDwg.ps1`：`-Fingerprint` 或 `-DxfOrDwgPath`（二选一）、`-Output`、`-Name`、`-Units`。能直读还原的（LINE/CIRCLE/TEXT/MTEXT/INSERT）逐个转 spec 实体，证据级别 `known`；还原不了的写进 `needsReview` 数组（ARC 起止角、DIMENSION 端点、LWPOLYLINE 顶点、SPLINE/HATCH 等），证据级别 `inferred`。**交付规则：`needsReview` 不为空时，产物是骨架不是重建——要么逐项人工修 spec，要么在交付说明里明说。**
+
+`Invoke-CadVisualCompare.ps1`：`-Dxf`（必填，重建产物）、参照二选一 `-ReferenceDxf`（几何模式）或 `-ReferenceImage`（像素模式，需配 `-Preview`）、`-GeometryTolerance`（默认 0.01）、`-PixelTolerance`（默认 32）、`-AsJson`。几何模式查四项：实体总数 / 类型分布 / 图层集合 / 逐实体坐标配对，全部 `known` 级；像素模式走 `Compare-CadImage` 粗判，`inferred` 级，结论档位不会高过 `needs_review`——这是故意的：像素像不等于尺寸对。
 
 ## 导出与打印层
 
