@@ -256,10 +256,18 @@ $dxf = Write-CadImageDxf -Geometry $geo -Output "out.dxf" -Scale 0.1
 & "<skill>\scripts\Invoke-CadCom.ps1" -Action Info -AsJson
 & "<skill>\scripts\Invoke-CadCom.ps1" -Action Draw -SpecFile "drawing.json" -Visible -AsJson
 & "<skill>\scripts\Invoke-CadCom.ps1" -Action Export -Path "drawing.dwg" -Output "out.dxf" -AsJson
+& "<skill>\scripts\Invoke-CadCom.ps1" -Action PaperSpace -SpecFile "drawing.json" -Output "layout.pdf" -AsJson
 & "<skill>\scripts\Invoke-CadCom.ps1" -Action Quit -AsJson
 ```
 
-参数：`-Action`（`Info`/`Draw`/`Open`/`Export`/`Quit`）、`-SpecFile`、`-Path`、`-Output`、`-PaperSize`、`-StyleTable`、`-Visible`、`-KeepOpen`、`-AsJson`、`-TimeoutSeconds`。
+参数：`-Action`（`Info`/`Draw`/`Open`/`Export`/`Quit`/`PaperSpace`）、`-SpecFile`、`-Path`、`-Output`、`-PaperSize`、`-StyleTable`、`-LayoutName`（默认 `CAD_PS`，已存在则复用）、`-Visible`、`-KeepOpen`、`-AsJson`、`-TimeoutSeconds`。
+
+**`-Action PaperSpace`（图纸空间/布局出 PDF，仅 COM 通道可做）**：在模型空间画 spec 实体 → 建（或复用）`-LayoutName` 布局并切换 → 图纸空间画标题框（按 `-PaperSize` 尺寸、边距 10mm）+ 标题文字（取 spec 的 `name`）+ 居中视口显示模型空间内容 → `PlotToFile` 出 PDF。报告含 `layout` 与 `paperSpaceCount` 字段。实测：AutoCAD 2018、A4、7 实体 spec，36 秒，PDF 1 页，无遗留进程。
+
+**图纸空间的两条铁律（实测）**：
+
+1. **拿图纸空间块必须 `$blk = $layout.Block` 直接赋值。** `$doc.PaperSpace` 集合一经 scriptblock / `InvokeReturnAsIs` / 任何管道包装就退化成 `Object[]`，`AddCircle` 报「不包含名为 'AddCircle' 的方法」——这是 COM 封送行为，与重试无关。
+2. **点参数必须走 `ConvertTo-CadComPoint`**（`return , $a` 一元逗号）。内联 `@(x,y,0)` 会被 PowerShell 沿管道展开成多个 double。
 
 ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.Application.22`（本机实测只有这个，**没有 `CurVer`、也没有 `.22.0`**）→ `AutoCAD.Application`。
 

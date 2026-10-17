@@ -416,7 +416,7 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 - **只测过 AutoCAD 2018**。2013–2025 的接口理论上一致（都是 `accoreconsole` + LISP），但没有逐一验证。低版本可能不认较新的 DXF 版本号。
 - **COM 通道不适用于无界面机器**：`acad.exe` 要真的起得来。`Invoke-CadCom.ps1` 有 `-Visible` 但默认不可见，起一次约 25 秒。且 PowerShell 的 COM 编组不支持 `VT_ARRAY|VT_DISPATCH`，`CopyObjects` 跑不通（复制实体请走 `COPYCLIP`/`WBLOCK` 或选择集重建）。
-- **accoreconsole 没有布局引擎**：`layoutlist` / `-LAYOUT` / `setvar "CTAB"` / `tblnext "LAYOUT"` / 410 组码全不可用，要操作图纸空间只能走 COM 通道打开 `acad.exe`。
+- **accoreconsole 没有布局引擎**：`layoutlist` / `-LAYOUT` / `setvar "CTAB"` / `tblnext "LAYOUT"` / 410 组码全不可用，要操作图纸空间只能走 COM 通道的 `-Action PaperSpace`（内部走 `$layout.Block` 直接赋值，`$doc.PaperSpace` 集合会被 COM 封送破坏）。
 - **DXF 版本控制走 `SAVEAS`**：`DXFOUT` 的第二个参数是精度不是版本（实测传 `"12"/"13"/"16"` 全出 `AC1032`）。
 - **不支持天正/中望等第三方对象**：只有 AutoCAD 原生实体能保证被解析。
 - **不做批量/多图并行**：一次一个 `accoreconsole` 实例，并发要调用方自己排。
@@ -435,7 +435,7 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 # 1) 单元测试（秒级，不需要 AutoCAD）
-pwsh -File "$s\run-unit-test.ps1"                       # 265 项
+pwsh -File "$s\run-unit-test.ps1"                       # 279 项
 
 # 2) 集成自检（真出图，约 40 秒）
 pwsh -File "$s\run-test.ps1" -Test all                  # 65 项
@@ -447,7 +447,7 @@ pwsh -File "$s\run-scenario-test.ps1" -Mode real        # 3 个，真机
 pwsh -File "$s\run-scenario-test.ps1" -ListScenarios     # 看全部场景
 ```
 
-当前状态：**265 / 265**、**65 / 65**、**15 / 15**、**11 / 11**、**3 / 3**，全绿。
+当前状态：**279 / 279**、**65 / 65**、**15 / 15**、**11 / 11**、**3 / 3**，全绿。
 
 三档模式回答三个不同的问题：
 

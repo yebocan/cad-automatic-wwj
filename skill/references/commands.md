@@ -1,4 +1,4 @@
-# 命令清单
+﻿# 命令清单
 
 所有脚本都在 `scripts\` 下，都用 `pwsh` 跑。共同惯例：
 
@@ -272,10 +272,11 @@
 ## 6. `Invoke-CadCom.ps1` — COM 通道
 
 ```powershell
-.\Invoke-CadCom.ps1 -Action <Info|Draw|Open|Export|Quit>
+.\Invoke-CadCom.ps1 -Action <Info|Draw|Open|Export|Quit|PaperSpace>
                     [-SpecFile <json>] [-Path <dwg>] [-Output <pdf>]
                     [-PaperSize <尺寸>] [-StyleTable <monochrome.ctb|none>]
-                    [-Visible] [-KeepOpen] [-AsJson] [-TimeoutSeconds <int=180>]
+                    [-LayoutName <CAD_PS>] [-Visible] [-KeepOpen] [-AsJson]
+                    [-TimeoutSeconds <int=180>]
 ```
 
 | Action | 说明 |
@@ -285,11 +286,13 @@
 | `Open` | 打开图纸 |
 | `Export` | 导出 PDF |
 | `Quit` | 退出 AutoCAD |
+| `PaperSpace` | 图纸空间/布局出 PDF：模型空间画 spec → 建/复用 `-LayoutName` 布局 → 图纸空间画标题框+标题+视口 → `PlotToFile` |
 
 | 参数 | 说明 |
 |---|---|
 | `-Visible` | 显示 AutoCAD 窗口（默认 `Visible=$false`，后台跑） |
 | `-KeepOpen` | 执行完不 `Quit`（默认会 Quit 并 `ReleaseComObject`） |
+| `-LayoutName` | `PaperSpace` 动作的目标布局名，默认 `CAD_PS`；已存在则复用 |
 
 **什么时候才该用 COM**：
 
@@ -328,7 +331,7 @@
 
 **`CopyObjects` 在 PowerShell 里跑不通**（这是拿对象级 API 复制实体的常规做法）：`object[]`、反射 `InvokeMember`、`VariantWrapper` 包装三种姿势都回「对象数组无效」，同文档内调用回「Value does not fall within the expected range」。根因是 PowerShell 的 COM 编组不支持 `VT_ARRAY|VT_DISPATCH`，Python 侧靠 `pythoncom` 显式构造才成立。要复制实体请走命令行 `COPYCLIP`/`WBLOCK`，或在 accoreconsole 里用选择集重建。
 
-**图纸空间同理走不通**：accoreconsole 没有布局引擎——`layoutlist` 不存在、`-LAYOUT` 命令不存在、`setvar "CTAB" "Layout1"` 被拒、`tblnext "LAYOUT"` 返 `none`、`ssget "_X" '((410 . "Model"))'` 返 nil。要操作布局只能用 COM 通道打开 `acad.exe`。
+**图纸空间同理走不通（accoreconsole 侧）**：accoreconsole 没有布局引擎——`layoutlist` 不存在、`-LAYOUT` 命令不存在、`setvar "CTAB" "Layout1"` 被拒、`tblnext "LAYOUT"` 返 `none`、`ssget "_X" '((410 . "Model"))'` 返 nil。**要操作布局只能用 COM 通道的 `-Action PaperSpace`**，且内部必须走 `$layout.Block`（`$doc.PaperSpace` 集合经管道包装会退化 `Object[]`，`AddXxx` 报「不包含此方法」），点参数必须 `ConvertTo-CadComPoint` 单对象封送。
 
 在 accoreconsole 里筛模型空间实体用 `((67 . 0))`（410 组码不可用）：
 

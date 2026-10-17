@@ -1097,6 +1097,53 @@ Check 'vectorize CLI: dot-source CadVectorize.ps1' ($gii -like "*Join-Path `$scr
 Check 'vectorize CLI: dot-source CadPdf.ps1（New-CadDxfText）' ($gii -like "*Join-Path `$scriptDir 'CadPdf.ps1'*") ''
 
 # ══════════════════════════════════════════════════════════════════
+#  23. COM 通道 -Action PaperSpace（静态断言，全部读源码不连 COM）
+# ══════════════════════════════════════════════════════════════════
+
+$comPath = Join-Path $PSScriptRoot 'Invoke-CadCom.ps1'
+$comTxt = ''
+if (Test-Path $comPath) { $comTxt = [IO.File]::ReadAllText($comPath) }
+$comBom = $false
+$comDoubleBom = $false
+if (Test-Path $comPath) {
+    $b = [IO.File]::ReadAllBytes($comPath)
+    if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+        $comBom = $true
+        if ($b.Length -ge 6 -and $b[3] -eq 0xEF -and $b[4] -eq 0xBB -and $b[5] -eq 0xBF) { $comDoubleBom = $true }
+    }
+}
+Check 'com-paperspace: Invoke-CadCom.ps1 有 UTF-8 BOM' $comBom 'PS5.1 按 ANSI 读无 BOM 中文文件会把 UTF-8 续字节当前导字节吞引号'
+Check 'com-paperspace: Invoke-CadCom.ps1 无双 BOM' (-not $comDoubleBom) '双 BOM 会让 PS5.1 把第二个当正文'
+
+Check 'com-paperspace: ValidateSet 含 PaperSpace' ($comTxt -like "*ValidateSet('Info', 'Draw', 'Open', 'Export', 'PaperSpace', 'Quit')*") '动作用户可选集'
+Check 'com-paperspace: 有 -LayoutName 参数' ($comTxt -match '\[string\]\$LayoutName') '默认 CAD_PS，已存在则复用'
+Check 'com-paperspace: report 有 layout 字段' ($comTxt -like "*layout*= *null*") '报告对象含布局名'
+Check 'com-paperspace: report 有 paperSpaceCount 字段' ($comTxt -like "*paperSpaceCount*") '报告对象含图纸空间实体数'
+
+# 图纸空间正路：Layout.Block（直接赋值，不能走 $doc.PaperSpace）
+Check 'com-paperspace: 用 Layout.Block 拿图纸空间块' ($comTxt -match '\$blk\s*=\s*\$psLayout\.Block') '铁律：PaperSpace 集合经管道展开退化 Object[]，Layout.Block 直接赋值才是真 __ComObject'
+Check 'com-paperspace: 不用 $doc.PaperSpace 建实体' (-not ($comTxt -match '\$doc\.PaperSpace\.Add')) '该集合的 AddXxx 在 PS 里必失败'
+
+# helper 三函数
+Check 'com-paperspace: helper New-CadComLayers 存在' ($comTxt -match 'function New-CadComLayers') '图层创建共用'
+Check 'com-paperspace: helper Add-CadComEntities 存在' ($comTxt -match 'function Add-CadComEntities') '实体绘制共用'
+Check 'com-paperspace: helper Invoke-CadComPlot 存在' ($comTxt -match 'function Invoke-CadComPlot') '打印共用（含轮询稳定）'
+
+# 逗号优先级坑：数组字面量里算术必须整体加括号（@($m + 5, ...) 会解析成 $m + (5, ...)）
+$badComma = @()
+foreach ($ml in $matches) { }
+$mm = [regex]::Matches($comTxt, '@\((\s*\$\w+\s*[+\-*/]\s*[^,()]+\s*,)')
+foreach ($x in $mm) { $badComma += $x.Index }
+Check 'com-paperspace: 数组字面量内算术整体加括号（逗号优先级坑）' ($badComma.Count -eq 0) ('未加括号的算术元素出现在偏移: ' + ($badComma -join ','))
+
+# 点封送铁律
+Check 'com-paperspace: ConvertTo-CadComPoint 一元逗号' ($comTxt -match 'return , \$a') '点必须以单对象传，否则沿管道展开成多个 double'
+
+# 退出姿势
+Check 'com-paperspace: finally 轮询进程退出' ($comTxt -match 'HasExited|Stop-Process') 'Quit 后 3s 还剩 1 个属退出中，须轮询而非立即报失败'
+
+
+# ══════════════════════════════════════════════════════════════════
 #  汇总
 # ══════════════════════════════════════════════════════════════════
 
