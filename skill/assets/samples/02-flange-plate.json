@@ -1,0 +1,33 @@
+{
+  "_comment": "法兰盘：外圆 + 内孔 + 6 个均布螺栓孔 + 中心线 + 引出标注 + 剖面线。演示 boltpattern / centerline / dimradius / hatch 四个工程常用族。",
+  "name": "flange-plate",
+  "units": "mm",
+  "layers": [
+    { "name": "OUTLINE", "color": 7 },
+    { "name": "HOLE", "color": 1 },
+    { "name": "CENTER", "color": 8, "ltype": "CENTER" },
+    { "name": "HATCH", "color": 9 },
+    { "name": "DIM", "color": 3 }
+  ],
+  "entities": [
+    { "type": "circle", "c": [0, 0], "r": 80, "layer": "OUTLINE" },
+    { "type": "circle", "c": [0, 0], "r": 30, "layer": "HOLE" },
+
+    { "type": "boltpattern", "c": [0, 0], "r": 55, "count": 6, "layer": "HOLE" },
+
+    { "type": "centerline", "c": [0, 0], "len": 180, "layer": "CENTER" },
+
+    { "type": "dimradius", "c": [0, 0], "r": 80, "at": [120, 90], "layer": "DIM" },
+    { "type": "dimradius", "c": [0, 0], "r": 30, "at": [-75, -60], "layer": "DIM" },
+
+    { "type": "hatch", "pattern": "ANSI31", "scale": 2, "seed": [0, 0], "layer": "HATCH" },
+
+    { "type": "mtext", "at": [-90, 105], "width": 120, "height": 6, "layer": "DIM", "value": "法兰盘 FL-80\n6×M12 均布于 φ110" }
+  ],
+  "save": {
+    "dwg": "flange-plate.dwg",
+    "dxf": true,
+    "dxfVersion": "2013",
+    "pdf": "A3"
+  }
+}

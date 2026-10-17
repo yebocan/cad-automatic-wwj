@@ -1,0 +1,32 @@
+# 自检与构建产物（脚本自己生成，不进仓库）
+skill-tests*/
+cad-skill-tests*/
+cad-scenario-tests*/
+result.json
+runDir/
+_tmp/
+*.log
+
+# AutoCAD 产物
+*.dwg
+*.dxf
+*.pdf
+*.bak
+*.sv$
+*.dwl
+*.dwl2
+Drawing1.dwg
+accore_stdout_*.txt
+accore_stderr_*.txt
+
+# 工作目录残留
+cad-automatic-wwj/work-*/
+cad-automatic-wwj/accore_*
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~

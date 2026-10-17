@@ -1,0 +1,38 @@
+{
+  "_comment": "齿轮与棘轮：演示 gear / polygon / arc / spline / ellipse 五个曲线族。gear 会按齿数自动生成渐开线近似齿形，polygon 生成正多边形。",
+  "name": "gears",
+  "units": "mm",
+  "layers": [
+    { "name": "GEAR", "color": 7 },
+    { "name": "SHAFT", "color": 1 },
+    { "name": "CENTER", "color": 8, "ltype": "CENTER" },
+    { "name": "NOTE", "color": 4 }
+  ],
+  "entities": [
+    { "type": "gear", "c": [0, 0], "r": 60, "teeth": 20, "layer": "GEAR" },
+    { "type": "circle", "c": [0, 0], "r": 12, "layer": "SHAFT" },
+    { "type": "centerline", "c": [0, 0], "len": 140, "layer": "CENTER" },
+
+    { "type": "gear", "c": [150, 0], "r": 30, "teeth": 10, "layer": "GEAR" },
+    { "type": "circle", "c": [150, 0], "r": 8, "layer": "SHAFT" },
+    { "type": "centerline", "c": [150, 0], "len": 80, "layer": "CENTER" },
+
+    { "type": "polygon", "c": [0, -110], "r": 35, "sides": 6, "layer": "GEAR" },
+    { "type": "polygon", "c": [100, -110], "r": 30, "sides": 8, "layer": "GEAR" },
+
+    { "type": "arc", "c": [150, -110], "r": 30, "start": 0, "end": 180, "layer": "GEAR" },
+    { "type": "arc", "c": [150, -110], "r": 24, "start": 200, "end": 340, "layer": "GEAR" },
+
+    { "type": "ellipse", "c": [0, -190], "rx": 45, "ry": 22, "layer": "GEAR" },
+
+    { "type": "spline", "points": [[100, -230], [140, -190], [190, -220], [240, -180]], "layer": "GEAR" },
+
+    { "type": "text", "at": [-60, 120], "value": "G20 / G10 齿轮副", "height": 8, "layer": "NOTE" }
+  ],
+  "save": {
+    "dwg": "gears.dwg",
+    "dxf": true,
+    "dxfVersion": "2018",
+    "pdf": "A2"
+  }
+}

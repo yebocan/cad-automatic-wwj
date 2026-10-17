@@ -1,0 +1,69 @@
+{
+  "_comment": "全部 21 种实体各来一个，用来验证编译器覆盖面。点/线/多段线/闭合多段线/圆/弧/矩形/椭圆/样条/正多边形/齿轮/中心线/螺栓阵列/单行文字/多行文字/线性标注/对齐标注/半径标注/填充/实体填充/块。",
+  "name": "all-entities",
+  "units": "mm",
+  "layers": [
+    { "name": "GEOM", "color": 7 },
+    { "name": "CURVE", "color": 4 },
+    { "name": "ANNO", "color": 3 },
+    { "name": "FILL", "color": 9 }
+  ],
+  "blocks": [
+    {
+      "name": "BOLT_M12",
+      "base": [0, 0],
+      "entities": [
+        { "type": "circle", "c": [0, 0], "r": 6 },
+        { "type": "circle", "c": [0, 0], "r": 3 }
+      ]
+    }
+  ],
+  "entities": [
+    { "type": "point", "at": [0, 0], "layer": "GEOM" },
+
+    { "type": "line", "p1": [10, 0], "p2": [60, 40], "layer": "GEOM" },
+
+    { "type": "polyline", "points": [[0, 60], [30, 80], [60, 60]], "layer": "GEOM" },
+    { "type": "polyline", "points": [[80, 60], [110, 80], [140, 60]], "closed": true, "layer": "GEOM" },
+
+    { "type": "circle", "c": [180, 70], "r": 20, "layer": "CURVE" },
+
+    { "type": "arc", "c": [240, 70], "r": 25, "start": 30, "end": 150, "layer": "CURVE" },
+
+    { "type": "rect", "p1": [0, 120], "p2": [70, 170], "layer": "GEOM" },
+
+    { "type": "ellipse", "c": [120, 145], "rx": 40, "ry": 20, "layer": "CURVE" },
+
+    { "type": "spline", "points": [[180, 120], [210, 170], [250, 120], [280, 160]], "layer": "CURVE" },
+
+    { "type": "polygon", "c": [340, 145], "r": 30, "sides": 6, "layer": "GEOM" },
+
+    { "type": "gear", "c": [60, 240], "r": 45, "teeth": 16, "layer": "GEOM" },
+
+    { "type": "centerline", "c": [170, 240], "len": 110, "layer": "CURVE" },
+
+    { "type": "boltpattern", "c": [280, 240], "r": 40, "count": 5, "layer": "GEOM" },
+
+    { "type": "text", "at": [0, 300], "value": "TEXT 单行", "height": 8, "layer": "ANNO" },
+    { "type": "text", "at": [120, 300], "value": "旋转文字", "height": 8, "rotation": 30, "layer": "ANNO" },
+
+    { "type": "mtext", "at": [230, 300], "width": 140, "height": 6, "layer": "ANNO", "value": "MTEXT 多行\n第二行内容\n第三行" },
+
+    { "type": "dimlinear", "p1": [0, 120], "p2": [70, 120], "at": [35, 105], "layer": "ANNO" },
+    { "type": "dimaligned", "p1": [10, 0], "p2": [60, 40], "at": [20, 35], "layer": "ANNO" },
+    { "type": "dimradius", "c": [180, 70], "r": 20, "at": [215, 95], "layer": "ANNO" },
+
+    { "type": "hatch", "pattern": "ANSI37", "scale": 3, "seed": [35, 145], "layer": "FILL" },
+
+    { "type": "solid", "points": [[240, 190], [300, 190], [240, 220], [300, 220]], "layer": "FILL" },
+
+    { "type": "block", "name": "BOLT_M12", "at": [340, 300], "scaleX": 2, "scaleY": 2, "rotation": 15, "layer": "GEOM" }
+  ],
+  "save": {
+    "dwg": "all-entities.dwg",
+    "dxf": true,
+    "dxfVersion": "2018",
+    "pdf": "A2",
+    "version": "2018"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "_comment": "故意做坏：color 是字符串、ltype 是不存在的线型。图层要能建出来（回落默认），不能整张图失败。",
+  "name": "bad-color",
+  "layers": [
+    { "name": "GEO", "color": "red", "ltype": "NO_SUCH_LINETYPE" }
+  ],
+  "entities": [
+    { "type": "line", "layer": "GEO", "p1": [0, 0], "p2": [100, 0] }
+  ],
+  "save": { "dwg": "bad-color.dwg" }
+}

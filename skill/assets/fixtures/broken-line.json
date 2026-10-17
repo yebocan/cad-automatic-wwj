@@ -1,0 +1,11 @@
+{
+  "_comment": "故意做坏：line 缺 p2，circle 缺 r，第三个实体才是好的。用来验证「单实体失败不影响整张图」。",
+  "name": "broken-line",
+  "layers": [{ "name": "GEO", "color": 7 }],
+  "entities": [
+    { "type": "line", "layer": "GEO", "p1": [0, 0] },
+    { "type": "circle", "layer": "GEO", "c": [50, 50] },
+    { "type": "line", "layer": "GEO", "p1": [0, 0], "p2": [100, 100] }
+  ],
+  "save": { "dwg": "broken-line.dwg" }
+}

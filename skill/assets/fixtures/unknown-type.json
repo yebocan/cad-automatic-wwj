@@ -1,0 +1,10 @@
+{
+  "_comment": "故意做坏：spiral 不在支持的类型表里。错误信息必须回显全部合法 type，让调用方能自己改。",
+  "name": "unknown-type",
+  "layers": [{ "name": "GEO", "color": 7 }],
+  "entities": [
+    { "type": "spiral", "layer": "GEO", "c": [0, 0], "r": 40 },
+    { "type": "circle", "layer": "GEO", "c": [0, 0], "r": 10 }
+  ],
+  "save": { "dwg": "unknown-type.dwg" }
+}

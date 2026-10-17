@@ -1,0 +1,30 @@
+{
+  "_comment": "最简单的入门例子：一张 A4 大小的矩形板，两个圆孔，一条中心线，一个尺寸。适合第一次验证 accoreconsole 能不能跑起来。",
+  "name": "simple-plate",
+  "units": "mm",
+  "layers": [
+    { "name": "OUTLINE", "color": 7, "ltype": "CONTINUOUS" },
+    { "name": "HOLE", "color": 1 },
+    { "name": "CENTER", "color": 8, "ltype": "CENTER" },
+    { "name": "DIM", "color": 3 }
+  ],
+  "entities": [
+    { "type": "rect", "p1": [0, 0], "p2": [180, 100], "layer": "OUTLINE" },
+
+    { "type": "circle", "c": [45, 50], "r": 15, "layer": "HOLE" },
+    { "type": "circle", "c": [135, 50], "r": 15, "layer": "HOLE" },
+
+    { "type": "centerline", "c": [90, 50], "len": 200, "layer": "CENTER" },
+
+    { "type": "dimlinear", "p1": [0, 0], "p2": [180, 0], "at": [90, -18], "layer": "DIM" },
+    { "type": "dimradius", "c": [45, 50], "r": 15, "at": [78, 72], "layer": "DIM" },
+
+    { "type": "text", "at": [10, 108], "value": "简单板 180x100", "height": 5, "layer": "DIM" }
+  ],
+  "save": {
+    "dwg": "simple-plate.dwg",
+    "dxf": true,
+    "dxfVersion": "2018",
+    "pdf": "A4"
+  }
+}
