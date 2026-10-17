@@ -24,14 +24,28 @@
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `name` | string | 否 | 只用于日志/报告，不写进图纸 |
-| `units` | string | 否 | 仅回显，不执行 `INSUNITS` 切换（要改单位请用 `c:SETUP` 之外的系统变量流程） |
+| `units` | string | 否 | **会真的生效**：合法值会生成 `(cadunits <code>)` 在出图前 `setvar "INSUNITS"`。合法值见下表；不写或写错只记 warning 不挡路 |
 | `layers` | array | 否 | 图层声明。**实体引用了但没声明的图层会自动补建**（颜色 7）并记 warning |
 | `blocks` | array | 否 | 块定义 |
 | `entities` | array | **是** | 实体列表，按数组顺序依次创建 |
 | `save` | object | 否 | 存盘/导出。不写就只画不存（适合 `-DryRun` 之外的快速验证） |
+| `constraints` | object | 否 | 出图前的约束校验，见第 8 节 |
 | `zoom` | bool | 否 | 默认 `true`。画完执行 `c:ZOOMEXT` |
 
 `entities` 缺失或为空数组都不会崩，只是画出空图（`entityCount=0`）。
+
+### `units` 合法值
+
+| 写法 | INSUNITS | 含义 |
+|---|---|---|
+| `unitless` | `0` | 无单位 |
+| `in` / `英寸` | `1` | 英寸 |
+| `ft` / `英尺` | `2` | 英尺 |
+| `mm` / `毫米` / `公厘` | `4` | 毫米 |
+| `cm` / `厘米` | `5` | 厘米 |
+| `m` / `米` / `公尺` | `6` | 米 |
+
+不写 `units` 不生成 `cadunits` 调用（保持图纸原样），记 warning「spec 未声明 units」；写错只记 warning 并列出可用值。
 
 ---
 
@@ -44,11 +58,13 @@
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `name` | string | **必填** | 图层名。已存在则只更新颜色/线型 |
-| `color` | int | `7` | AutoCAD 颜色号 1–255 |
+| `color` | int | `7` | AutoCAD 颜色号 1–255。**越界或非整数会回落 7 并记 warning**，不会崩 |
 | `ltype` | string | `""` | 线型名。`""` 表示不动。`DASHED`/`CENTER`/`HIDDEN` 等需已加载 |
 | `ltypeScale` | double | — | 保留字段，当前未下发 |
 
 > 编译器内部固定调用 `(c:LAYER name color ltype)` 三个实参 —— LISP 没有默认值，缺一个就报「参数太少」。
+>
+> **线型不存在会让 `-LAYER` 悬停到超时**：AutoCAD 只打一行「未找到线型」，然后继续等输入。`c:LAYER` 会先 `(tblsearch "LTYPE" ltype)` 查一下，查不到就退回 `CONTINUOUS`，并在回执里打 `@@LTYPE_MISSING.<图层>=<你写的线型>@@`，报告里变成一条 warning。
 
 ---
 
@@ -436,7 +452,17 @@ entmake 组码：`(0."MTEXT")(100."AcDbEntity")(8.layer)(100."AcDbMText")(10.x,y
 | `base` | 否 | `[0,0]` | 基点 |
 | `entities` | ✔ | — | 块内实体，语法与顶层 `entities` 完全相同 |
 
-块定义用 `c:MAKEBLOCK`（`-BLOCK` + 包围盒选择集）。块里的实体先画在图纸空间，再被收进块定义。
+块定义用 `c:BEGBLOCK` / `c:ENDBLOCK` 一对，**不是**把 `(command "_.-BLOCK" ...)` 包住画图命令。
+
+原因是 `-BLOCK` 给完基点和名字就进「选择对象:」，**不会**进入「后续实体自动入块」状态，后面那条画图命令的坐标会被当成「选择点」吃掉 → `*无效选择*` → 整张图卡到超时。`(princ "\n")` 也救不了（princ 只往 stdout 打字，不往命令输入队列送回车）。
+
+正确流程：
+
+1. `c:BEGBLOCK` 记下进块前的 `(entlast)`；
+2. 块内实体正常画到模型空间；
+3. `c:ENDBLOCK` 用 `(entnext)` 从记下的那个之后走到尾，全部 `ssadd` 进选择集；
+4. `(cadcmd (list "_.-BLOCK" name (list x y) ss ""))` 一次性把选择集喂进去；
+5. 用 `(tblobjname "BLOCK" name)` + `entnext` 数一遍块内实体数，确认真的成了。
 
 ---
 
@@ -502,6 +528,7 @@ entmake 组码：`(0."MTEXT")(100."AcDbEntity")(8.layer)(100."AcDbMText")(10.x,y
 {
   "name": "flange-plate",
   "units": "mm",
+  "constraints": { "maxEntities": 20, "requiredLayers": ["GEO", "HOLE", "DIM"] },
   "layers": [
     { "name": "GEO",    "color": 7 },
     { "name": "HOLE",   "color": 1 },
@@ -541,3 +568,43 @@ entmake 组码：`(0."MTEXT")(100."AcDbEntity")(8.layer)(100."AcDbMText")(10.x,y
 ```
 
 > 注意 `entityCount` 是 **JSON 里声明的实体数**。实际 DXF 里的实体数会更多 —— 块定义、填充边界、标注的组成件都会产生额外实体。所以 `checks` 里"DWG 实体数与 JSON 一致"永远不会成立，编译器只做一个「差额警告」。
+
+---
+
+## 8. `constraints{}` — 出图前约束
+
+```json
+"constraints": {
+  "maxEntities": 50,
+  "minEntities": 1,
+  "maxLayers": 8,
+  "requiredLayers": ["GEO", "HOLE", "DIM"],
+  "units": "mm"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `maxEntities` | int | 声明实体数超过它就报错（防 spec 写飞） |
+| `minEntities` | int | 少于它就报错 |
+| `maxLayers` | int | 图层数超过它就报错 |
+| `requiredLayers` | array | 这些图层必须在 `layers[]` 里声明过 |
+| `units` | string | 顶层没写 `units` 时用这个兜 |
+
+**约束冲突是必然失败类错误**，`Test-CadSpec.ps1` 会在启动 AutoCAD 之前就报出来，`Invoke-CadDraw.ps1` 的 `checks` 里也会体现（编译失败数 > 0 时该 check 不通过）。
+
+### 出图前预检会抓的必然失败
+
+| 症状 | 报错 |
+|---|---|
+| 半径/宽度为负或 0 | `半径必须大于 0` / `宽度为 0` |
+| 坐标绝对值超 ±10⁷ | `坐标超出 ±10000000`（多半是单位或小数点写错） |
+| `polyline` 只有 1 个点 | `至少需要 2 个点` |
+| 点是平铺数字数组 | `是平铺的数字数组，应该是 @(@(x,y),...)` |
+| 未知 `type` | 报错文本列出全部 21 种合法取值 |
+| 重复 `id` | 点名重复的 id |
+| 重复图层 | 点名重复的图层名 |
+
+### 只记 warning 不挡路的四类
+
+未声明图层（编译器会自动补建）、缺 `units`、非法 `units`、`dxfVersion` 非法值 —— 都会给出回落值，不阻止出图。

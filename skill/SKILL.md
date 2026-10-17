@@ -1,6 +1,6 @@
 ---
 name: cad-automatic-wwj
-description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
+description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
 ---
 
 # CAD Automatic WWJ
@@ -123,6 +123,33 @@ accoreconsole 的日志写 `%TEMP%\cad-automatic-wwj\accore_stdout_<时间戳>.t
 
 DWG 路径要先把 DWG 转成 DXF 再解析（用 accoreconsole 开图 → `c:SAVEDXF` → 临时目录 → 解析 → 删除）。这条路径实测 3.7 秒，如果跑到 120 秒超时，说明 `.scr` 末尾缺 `_N`，卡在「是否保存对 xxx 的修改？」上——见 troubleshooting。
 
+### 结论分级与证据链
+
+`run-test.ps1 -Test evidence` 与 [scripts/CadEvidence.ps1](scripts/CadEvidence.ps1) 提供两件事：
+
+**证据分级**——每条结论都要说清自己是「量到的」还是「猜的」：
+
+| 级 | 含义 | 例子 |
+|---|---|---|
+| `known` | 直接读到的硬事实 | DXF 里 `$INSUNITS=4`、DWG 头是 `AC1032`、实体数 13 |
+| `scaled` | 读到锚点后换算出来的 | 按 INSUNITS=4 把 100 换算成 100mm、按比例尺反推 |
+| `inferred` | 有依据但没直读到 | 图层里有 HATCH 就推断有填充区 |
+| `unreadable` | 想读但读不到 | 文件打不开、变量不存在、段被截断 |
+
+**五态结论**（`Get-CadDisposition`，优先级从高到低，取命中的最高档）：
+
+| 结论 | 触发条件 | 给用户的建议 |
+|---|---|---|
+| `blocked` | 有 `BlockedReason`（出图前就发现必然失败，一个实体都没画） | 按 errors 改完再跑 |
+| `fail` | 有 error | 看 error 字段 |
+| `needs_review` | 只有 `unreadable` / `inferred` 级证据 | 产物可能是对的，但没有证据证明它是对的；请开图核对关键尺寸 |
+| `pass_with_warnings` | 有 warning | 可以用，但看一眼 warning |
+| `pass` | 全部 `known` 级 | 放心用 |
+
+⚠️ **产物存在与否不改变结论档位**——`error` + 有半成品仍然只是 `fail`，不会升级成 `blocked`。产物在不在只影响调用方能不能救回半成品。
+
+**清单复现**（`New-CadManifest` / `Write-CadManifest` / `Compare-CadManifest`）回答「这两次跑出来的是不是同一张图」。只比稳定的字段：`specSha256`、`cadCoreSha256`、`units.code`、`entityCount`、`artifacts[].sha256`（按 `kind` 对齐）。**不比** `timestamp`、路径、`disposition`。两个哈希是 `New-CadManifest` 自己从 `$SpecFile` 与 `cadcore.lsp` 现算的——传不传都会算，读不到就给 `$null` 让比对判差异，**绝不填假哈希**（假哈希会让 `identical=true` 变成谎言）。
+
 ## 导出与打印层
 
 ```powershell
@@ -133,6 +160,51 @@ DWG 路径要先把 DWG 转成 DXF 再解析（用 accoreconsole 开图 → `c:S
 `Export-CadToDxf.ps1`：`-Path`（必填）、`-Output`、`-Version`（`2018`/`2013`/`2010`/`2007`/`2004`/`R12`，默认 2018）、`-AsJson`、`-TimeoutSeconds`、`-AccoreConsole`。报告里除 `version`（你请求的）还有 `actualVersion`（文件里实际的 `$ACADVER`）与 `versionMatch`——**请求和事实分开写**，不一致时 status 落 `partial` 并给 warning。已实测 R12→AC1009、2013→AC1027、2018→AC1032 三者 `versionMatch=true`。
 
 `Invoke-CadPlot.ps1`：`-Path`、`-Output`、`-PaperSize`（`A0`–`A4`/`B`–`E`，默认 A3）、`-Orientation`（`Landscape`/`Portrait`）、`-PlotArea`（`Extents`/`Display`/`Limits`/`Window`）、`-StyleTable`（`monochrome.ctb`/`none`）、`-AsJson`、`-TimeoutSeconds`、`-AccoreConsole`。报告里 `orientation` 与 `plotArea` 会**回显你传入的值**，`pages` 是实际数出来的页数，`valid` 是结构校验结果。`status` 只有 `ok` / `invalid` / `failed` 三种。
+
+## PDF 矢量路径转 DXF
+
+```powershell
+& "<skill>\scripts\Convert-CadPdfToDxf.ps1" -Path "drawing.pdf" -Output "out.dxf" -AsJson
+```
+
+参数：`-Path`（必填）、`-Output`、`-Page`（默认 1）、`-Scale`（默认 1.0，pt→mm 用 `0.352778`）、`-Layer`（默认 `PDF_STROKE`）、`-BezierSegments`（默认 8）、`-IncludeFill`、`-AsJson`。**纯本地解析，不启动任何进程，所以没有 `-TimeoutSeconds`。**
+
+支持 `m/l/c/v/y/re/h` 路径算子、`S/s/f/F/f*/B/B*/b/b*/n` 上色算子、`q/Q/cm/w` 图形状态，FlateDecode 与 AsciiHex 过滤器。产物是 R12（AC1009）DXF：两点出 `LINE`，多点亮式 `POLYLINE`（`66=1` + VERTEX + SEQEND）。
+
+三条实现铁律（都踩过，源码里有注释）：
+
+1. **`switch` 必须加 `-CaseSensitive`**。不加的话 `'q'` 分支压栈、`'Q'` 分支又弹栈，`cm` 变换被静默清掉——症状是坐标原样透传、缩放丢失、位置偏移，**没有任何报错**。
+2. **CTM 快照要连 `lineWidth` 一起存**，`q/Q` 只恢复矩阵不够。
+3. **`Get-CadPdfStreams` 在没找到流时返回 `$null`**，取 `.Count` 会抛「在此对象上找不到属性 Count」而报错位置指向 `return` 行。一律先 `@(...)` 包一层。
+
+位图 PDF（只含 DCTDecode XObject）会明确报「没找到可解析的矢量内容流，这多半是扫描件，需要先 OCR/矢量化」，exit 1——**不猜、不画一个空图交差**。
+
+## 图片预检
+
+```powershell
+& "<skill>\scripts\Get-CadImageInfo.ps1" -Path "photo.png" -AsJson
+```
+
+[CadImage.ps1](scripts/CadImage.ps1) 提供四个层次，别混用：
+
+| 函数 | 回答什么 | 关键字段 |
+|---|---|---|
+| `Get-CadImageInfo` | 这是什么图 | `format` `width` `height` `dpiX` `pixelFormat` `valid` `reason` |
+| `Get-CadImageInk` | 图里有多少墨、偏在哪 | `inkRatio` `inkPixels` `meanLuma` `contrast` `bounds` `emptyBorder` `darkIsInk` |
+| `Test-CadImageUsable` | 能不能拿它照抄 | `ok` `issues[]` `advice`（**没有 `warnings` 字段**） |
+| `Get-CadImageAscii` | 让纯文本模型也「看」到形状 | 字符画 |
+
+`darkIsInk` 会自动判断：平均亮度 < 110 时按「亮的是墨」处理，否则 AutoCAD 黑底截图会被算成满墨，包围盒直接等于整张图。默认门槛是 200×200px、墨迹 0.2%–85%、对比度 ≥ 12——**这些不是物理定律，是「值得停下来问用户」的门槛**。
+
+⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。循环内部只做算术。
+
+## 出图前 spec 预检
+
+```powershell
+& "<skill>\scripts\Test-CadSpec.ps1" -SpecFile "drawing.json" -AsJson
+```
+
+在启动 accoreconsole **之前**就把「注定失败」的 spec 拦下来。会抓：负半径、`rect` 宽或高为 0（RECTANG 会退化成一条线）、坐标超出 ±10⁷（多半是单位或小数点写错）、`polyline` 只有 1 个点、点是平铺数字数组、重复 `id`、重复图层、`constraints` 冲突（`maxEntities` 等）。**合法的 warning 不会挡路**：未声明图层（编译器会补建）、缺 `units`、非法 `units`、`dxfVersion` 非法值都只记 warning 并给出回落值。
 
 ## 出图修复层
 
@@ -210,9 +282,9 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 
 | 用户想看什么 | 命令 | 验收重点 |
 |---|---|---|
-| 真机能不能画、产物对不对 | `run-test.ps1 -Test all` | 13 个实体全部落盘、块定义与块插入都成立、DWG/DXF/PDF 三结构校验通过、DXF 回读实体数与 JSON 声明交叉核对、中文未乱码、退出码 0、无残留进程（**47 项**） |
-| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析、PDF/DWG 结构校验、进程登记表六种拒绝条件（**149 项**） |
-| 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **9** / real **3**） |
+| 真机能不能画、产物对不对 | `run-test.ps1 -Test all` | 13 个实体全部落盘、块定义与块插入都成立、DWG/DXF/PDF 三结构校验通过、DXF 回读实体数与 JSON 声明交叉核对、中文未乱码、退出码 0、无残留进程、五态结论优先级、manifest 自比对与差异检出、PDF 矢量路径转 DXF 落在 MediaBox 内（**65 项**） |
+| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units（**240 项**） |
+| 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **14** / real **3**） |
 
 ```powershell
 & "<skill>\scripts\run-test.ps1"          -Test all -OutputDirectory "D:\some\writable\dir"
@@ -222,13 +294,13 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 & "<skill>\scripts\run-scenario-test.ps1" -Mode real                         # 真机
 ```
 
-`-Test` 可取 `all`（默认）、`draw`、`inspect`、`export`、`plot`、`repair`。加 `-KeepArtifacts` 保留中间产物。加 `-SkipCrossCheck` 跳过 DXF 回读交叉核对。单独跑 `-Test export` / `-Test plot` 时脚本会依次尝试 `draw\integration-draw.dwg` → `mini\integration-mini.dwg` → 现画一张 mini，**不会因为「没先跑 draw」就失败**。
+`-Test` 可取 `all`（默认）、`draw`、`inspect`、`export`、`plot`、`repair`、`evidence`、`pdf2dxf`。加 `-KeepArtifacts` 保留中间产物。加 `-SkipCrossCheck` 跳过 DXF 回读交叉核对。单独跑 `-Test export` / `-Test plot` 时脚本会依次尝试 `draw\integration-draw.dwg` → `mini\integration-mini.dwg` → 现画一张 mini，**不会因为「没先跑 draw」就失败**。
 
 `run-scenario-test.ps1` 的 `-Scenario` 可用 `all`（默认）或具体场景名，`-ListScenarios` 列出全部 14 个。`-Mode` 三选一：
 
 - **`real`** 真跑 accoreconsole。慢，但验证的是真机行为。
 - **`mock`** 用 [scripts/mock/fake-accoreconsole.cmd](scripts/mock/fake-accoreconsole.cmd) 冒充。它不猜产物路径，而是**读调用方真正生成的 `.scr` 和 `.lsp`**，从中抠出 `c:SAVEAS`/`c:SAVEDXF`/`c:PLOTPDF` 的目标路径再往那儿写产物——所以改脚本时 mock 不用跟着改。`MOCK_SCENARIO` 环境变量控制十种场景：`normal` / `lisp-error` / `not-found` / `no-done` / `no-artifact` / `same-handle` / `dialog` / `hang` / `bad-dxf` / `bad-pdf`。
-- **`offline`** 完全不执行进程，只验编译与参数校验。
+- **`offline`** 完全不执行进程，只验编译、参数校验、单位与图层分类、清单比对、PDF 矢量解析、图片预检。
 
 **判定标准**
 
@@ -264,14 +336,16 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 
 1. 先确认 accoreconsole 能定位（`Set-CadPath.ps1 -Show`）。定位不到就先解决这个，不要急着写 spec。
 2. 把用户需求翻译成 JSON：先定图层，再定几何，最后定标注与存盘。**尺寸、角度、坐标要写具体数字，不要写「大概」「合适」。**
-3. `-DryRun` 跑一遍，看编译警告与生成的 LISP。有实体编译失败就先改 spec。
-4. 真跑，读 `status` 与 `checks`。`partial` 要看清是哪条断言没过。
-5. 用 `Invoke-CadInspect.ps1` 回读产物，把**实际的实体数、图层、包围盒**报给用户作为证据。**不要只说"已生成"。**
-6. 交付时给出文件绝对路径与字节数。需要 DXF/PDF 就顺手导。
+3. 先跑 `Test-CadSpec.ps1` 做预检——它在启动 CAD 之前就把负半径、宽 0、坐标爆表这类必然失败拦下来，比跑 4 秒再失败快得多。
+4. `-DryRun` 跑一遍，看编译警告与生成的 LISP。有实体编译失败就先改 spec。
+5. 真跑，读 `status` 与 `checks`。`partial` 要看清是哪条断言没过。
+6. 用 `Invoke-CadInspect.ps1` 回读产物，把**实际的实体数、图层、包围盒、单位**报给用户作为证据。**不要只说"已生成"。**
+7. 需要复现或对比两次结果时写一份 manifest，用 `Compare-CadManifest` 判 identical。
+8. 交付时给出文件绝对路径与字节数。需要 DXF/PDF 就顺手导。
 
 ## 参考文档
 
-- [references/spec.md](references/spec.md) —— JSON 图纸描述完整 schema：21 种实体的字段、坐标与角度约定、图层规则、存盘选项
+- [references/spec.md](references/spec.md) —— JSON 图纸描述完整 schema：21 种实体的字段、坐标与角度约定、图层规则、单位、存盘选项、`constraints` 约束
 - [references/commands.md](references/commands.md) —— 全部脚本的参数、报告字段、退出码；cadcore.lsp 里 51 个 `c:XXX` 函数的必需参数
 - [references/protocol.md](references/protocol.md) —— accoreconsole 交互协议：scr 语法、marker 约定、退出码、stdout 编码、DXF 结构
 - [references/troubleshooting.md](references/troubleshooting.md) —— 按症状查：中文乱码、卡死、LISP 报错、产物 0 字节、找不到图纸、超时、残留进程

@@ -541,6 +541,144 @@ ConvertTo-CadPath -Path 'D:\deepseek harness gongzuoqu\cad\out.dwg'
 
 ---
 
+### 5.7 `switch` 不加 `-CaseSensitive`，PDF 坐标静默错位
+
+**现象**：`Convert-CadPdfToDxf` 导出的 DXF 坐标范围是 `(372,0)–(6369,3598)`，而 PDF 的 MediaBox 只有 `[0 0 842 595]`。缩放系数像没生效，位置整体偏移，**但没有任何报错**。
+
+**根因**：PowerShell 的 `switch` 默认不区分大小写，而 PDF 的 `q`/`Q` 是一对相反的操作：
+
+- `q` = 压栈保存当前图形状态（CTM、lineWidth）
+- `Q` = 弹栈恢复
+
+不加 `-CaseSensitive` 时，`'q'` 分支先把 CTM 压栈，紧接着 `'Q'` 分支的 `if ($stack.Count -gt 1)` 成立又弹栈，恢复成单位矩阵 —— **`cm` 变换被静默清掉**，坐标原样透传。
+
+**修法**：
+
+```powershell
+switch -CaseSensitive ($op) {
+    'q' { $stack.Push($ctm.Clone()) }
+    'Q' { if ($stack.Count -gt 0) { $ctm = $stack.Pop() } }
+}
+```
+
+顺带：CTM 快照要连 `lineWidth` 一起存，`q/Q` 只恢复矩阵不够。
+
+**「范围落在 MediaBox 内」是集成测试里的 CTM 哨兵**，专门抓这个 bug。
+
+---
+
+### 5.8 「在此对象上找不到属性 Count」，报错指向 `return` 行
+
+**现象**：`Get-CadPdfInfo` 对一个流都没有的 PDF 抛异常，报错位置指向函数末尾的 `return [pscustomobject]@{`，完全看不出是上面为空。
+
+**根因**：`Get-CadPdfStreams` 在没找到流时返回 **`$null`**（不是空数组），而 `streamCount = $streams.Count` 在 `$null` 上取 Count 抛异常。
+
+**修法**：一律先 `@(...)` 包一层，并把 `$contentStreams = @()` 的初始化移到 foreach 之前。
+
+```powershell
+$streams = @(Get-CadPdfStreams -Bytes $bytes)
+$contentStreams = @()
+```
+
+---
+
+### 5.9 DXF 解析出 0 对，`(0,SECTION)` 被吃
+
+**现象**：自己生成的 DXF 用 `Read-CadDxfPairs` 读出来只有 1 对甚至 0 对，TABLES 段（图层声明、线型表）全丢。
+
+**根因**：文件带 **UTF-8 BOM**。`[IO.File]::WriteAllText(path, str, [Text.Encoding]::UTF8)` 会写 BOM，解码后首行是 `\uFEFF0`，`Trim()` 剥不掉 → `int::TryParse` 失败 → `i += 2` 跳两行 → `(0,SECTION)` 连同值一起被吃。报错只出现在第 1 行、看不出因果。
+
+**修法**：写端用 `New-Object System.Text.UTF8Encoding($false)`，读端已加防御：
+
+```powershell
+if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+```
+
+---
+
+### 5.10 函数名撞内置别名，报错位置指向调用行
+
+**现象**：自己写的函数 `Rp` / `ReadPoint`，调用时报「无法处理命令，因为缺少一个或多个必需参数: Name」，位置指向**调用那一行**，完全不提函数定义。
+
+**根因**：**`rp` 是内置别名 `Remove-ItemProperty`**。函数名撞别名时，`Rp 'A'` 被当成 cmdlet 调用。
+
+**修法**：给函数取名避开单字母/短名别名（`h`=Get-History、`rp`=Remove-ItemProperty 等）。
+
+**教训**：先在最小复现里排除「函数名撞别名」，再怀疑业务逻辑 —— 本 skill 为这个走了 20+ 个探针。
+
+---
+
+### 5.11 `@($list)` 对 `List[object]` 抛「Argument types do not match」
+
+**现象**：`$x = @($someList)` 报参数类型不匹配，位置指向调用方那一行。
+
+**根因**：PowerShell 7.6.7 的已知行为。`List[int]` / `ArrayList` / `object[]` / 普通数组都正常，连空 `List[object]` 也 FAIL。
+
+**修法**：所有跨函数返回的 `List[object]` 一律 `.ToArray()`。
+
+---
+
+### 5.12 `$hash.PSObject.Properties['x']` 恒返回 `$null`
+
+**现象**：`Get-CadField` 对 `[ordered]@{}` 哈希表输入永远返回默认值，像是字段不存在。
+
+**根因**：`$hash.PSObject.Properties['name']` 只有对 **PSCustomObject** 才有效，对哈希表恒 `$null`。
+
+**修法**：函数开头加字典分支。
+
+```powershell
+if ($Object -is [System.Collections.IDictionary]) {
+    if (-not $Object.Contains($Name)) { return $Default }
+    ...
+}
+```
+
+---
+
+### 5.13 库文件有顶层 `param`，调用方报「缺少必需参数」
+
+**现象**：dot-source 了 `CadCommon.ps1`，调用 `Get-CadXxx -Path 'x'` 却报「缺少一个或多个必需参数: Path」，位置指向调用行。
+
+**根因**：库文件顶部有 `[CmdletBinding()] param(...)`，dot-source 时 PowerShell 按强制参数绑定。
+
+**修法**：库文件不放顶层 param。判断方法：
+
+```powershell
+$ast = [Parser]::ParseFile($path, [ref]$null, [ref]$null)
+$ast.ParamBlock   # 非 $null 就说明有
+```
+
+---
+
+### 5.14 `try/catch` 不能写在对象字面量里
+
+```powershell
+# 错 —— ParserError「语句块或类型定义中缺少右大括号」
+$out += [pscustomobject]@{ meas = try { ... } catch { ... } }
+
+# 对 —— 先算进变量
+$meas = try { ... } catch { ... }
+$out += [pscustomobject]@{ meas = $meas }
+```
+
+---
+
+### 5.15 `-replace` 的展开被解析成额外参数
+
+```powershell
+# 错 —— 「找不到 WriteAllText 的参数计数为 4 的重载」
+[IO.File]::WriteAllText($p, $str -replace 'T:', $d, [Text.Encoding]::GetEncoding(936))
+
+# 错 —— 「无法将参数 culture 转换为类型 ""」
+$str.Replace(@'...'@ -replace "`r`n","`n", @'...'@ -replace "`r`n","`n")
+
+# 对 —— 先赋给变量
+$norm = $old -replace "`r`n","`n"
+$new  = $norm.Replace($a, $b)
+```
+
+---
+
 ## 六、证据/报告类
 
 ### 6.1 回执看着像成功，实际失败
@@ -569,6 +707,54 @@ $report.checks | Where-Object { -not $_.pass }
 $hash = [ordered]@{}
 foreach ($mk in @($run.markers)) { $hash[[string]$mk.name] = $mk.value }
 ```
+
+### 6.4 图纸尺寸读出来是 `(0,0)`
+
+**现象**：`Get-CadExtentSize` 对一张明显有内容的图返回 `width=0 height=0`。
+
+**根因**：读 `$EXTMAX` 的 while 循环停止条件只写了 `-ne 9`。`$EXTMAX` 后面紧跟的是 `0=ENDSEC`，循环跨过段界一路读到 ENTITIES 段的 `10/20/30`，**把实体坐标覆盖成 `$EXTMAX` 的值**。如果那张图的第一个实体恰好在原点，结果就是 `(0,0)`。`$EXTMIN` 侥幸正确因为它后面紧跟 `$EXTMAX`（code 9）挡住了。
+
+**修法**：停止条件同时拦 code 9 与 code 0。
+
+```powershell
+while ($j -lt $pairs.Count -and $pairs[$j].code -ne 9 -and $pairs[$j].code -ne 0) { ... }
+```
+
+### 6.5 `manifest` 里 `specSha256` / `cadCoreSha256` 永远是空的
+
+**根因**：`New-CadManifest` 原来只读传入值，而调用方只传 `$SpecFile` 不传 `$SpecSha256`，cadcore.lsp 路径也不在参数里 → 两个字段永远为空，「同一份 spec 是否复现出同一张图」这个核心问题无法回答。
+
+**修法**：`New-CadManifest` 自己现算 —— `specSha256` 从 `$SpecFile` 算，`cadCoreSha256` 缺省回落 `Join-Path $PSScriptRoot 'cadcore.lsp'`。文件读不到给 `$null` 让比对判差异，**不给假值**。
+
+### 6.6 「图层声明了但空」被判成「图层不存在」
+
+**根因**：`Test-CadRequiredLayers` 原来只从实体的 8 组码反推图层（`Get-CadDxfEntities` 只读 ENTITIES 段），拿不到 TABLES 里的 LAYER 声明。
+
+**修法**：用 `Get-CadDxfLayerNames` 读 TABLES 段的声明，匹配顺序改为 `byLayer → declaredLower → missing`，结果分 `present`/`empty`/`missing` 三类。
+
+### 6.7 `Compare-CadManifest` 报「找不到与参数名称 'Path' 匹配的参数」
+
+**根因**：它吃的是**两个清单对象**（`-Before` / `-After`），不是文件路径。
+
+**修法**：先把落盘的 JSON 读回来再比 —— 顺带验了「写出去的能被读回来」这最后一环。
+
+```powershell
+$back = (Get-Content -Raw .\manifest.json) | ConvertFrom-Json
+$diff = Compare-CadManifest -Before $back -After $man
+# $diff.identical / $diff.diffCount / $diff.diffs[]（元素是 {field, before, after}）
+```
+
+返回字段是 `diffs` **不是 `differences`**。
+
+### 6.8 结论档位与预期不符
+
+**产物存在与否不改变结论档位**。`error` + 有半成品仍然只是 `fail`，不会升级成 `blocked`；`blocked` **只在 `$BlockedReason` 非空时**返回。产物在不在只影响调用方能否救回半成品。
+
+五态优先级：`blocked` > `fail` > `needs_review` > `pass_with_warnings` > `pass`。
+
+### 6.9 单位读不到
+
+`Get-CadDrawingUnits -Path <dxf>` 返回 `units` `unitToMm` `evidence`，**不是 `toMm`**。「mm / 毫米 / furlong 认不认」属于 `Get-CadUnitCode -Name`（认不出返回 **-1**，`unitless` → 0），不是 `Get-CadDrawingUnits -Units`（那个参数不存在）。
 
 ---
 

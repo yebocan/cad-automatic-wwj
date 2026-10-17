@@ -15,6 +15,7 @@
       .\Invoke-CadInspect.ps1 -Path drawing.dwg
       .\Invoke-CadInspect.ps1 -Path drawing.dwg -AsJson
       .\Invoke-CadInspect.ps1 -Path drawing.dxf -Entities -Limit 100
+      .\Invoke-CadInspect.ps1 -Path drawing.dxf -ExpectedUnits mm -RequiredLayers GEO,HOLE
 #>
 
 [CmdletBinding()]
@@ -24,7 +25,10 @@ param(
     [int]$Limit = 200,
     [switch]$AsJson,
     [int]$TimeoutSeconds = 120,
-    [string]$AccoreConsole
+    [string]$AccoreConsole,
+    # 验收条件：不传就只报告，传了才判合格与否
+    [string]$ExpectedUnits,
+    [string[]]$RequiredLayers
 )
 
 Set-StrictMode -Version Latest
@@ -32,6 +36,7 @@ $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'CadCommon.ps1')
+. (Join-Path $scriptDir 'CadEvidence.ps1')
 
 function Convert-CadDwgToDxf {
     <#
@@ -88,23 +93,31 @@ function Convert-CadDwgToDxf {
 }
 
 $report = [ordered]@{
-    status      = 'unknown'
-    path        = $null
-    format      = $null
-    valid       = $false
-    entityCount = $null
-    entityTypes = @()
-    layers      = @()
-    extents     = $null
-    blockCount  = $null
-    sections    = @()
-    version     = $null
-    entities    = @()
-    warnings    = @()
-    error       = $null
-    durationMs  = $null
+    status       = 'unknown'
+    path         = $null
+    format       = $null
+    valid        = $false
+    entityCount  = $null
+    entityTypes  = @()
+    layers       = @()
+    extents      = $null
+    blockCount   = $null
+    sections     = @()
+    version      = $null
+    units        = $null
+    unitsCheck   = $null
+    layersCheck  = $null
+    entities     = @()
+    evidence     = @()
+    disposition  = $null
+    advice       = $null
+    warnings     = @()
+    error        = $null
+    durationMs   = $null
 }
 $warnings = New-Object System.Collections.Generic.List[string]
+$evidence = New-Object System.Collections.Generic.List[object]
+$checks = New-Object System.Collections.Generic.List[object]
 $started = Get-Date
 $tempDir = $null
 
@@ -151,12 +164,72 @@ try {
         $report.entities = Get-CadDxfEntities -Path $dxfPath -Limit $Limit
     }
 
+    # ── 单位：一定要读出来，哪怕不验 ────────────────────────────
+    # 图纸不带单位是最常见的隐形缺陷：几何数值一模一样，
+    # 在 CAM 里能差出 1000 倍。所以「读到 mm」本身就该是一条证据。
+    $unitInfo = Get-CadDrawingUnits -Path $dxfPath
+    if ($unitInfo) {
+        $report.units = [pscustomobject]@{ code = $unitInfo.code; name = $unitInfo.name }
+        $evidence.Add($unitInfo.evidence) | Out-Null
+        if ($unitInfo.code -lt 0) {
+            $warnings.Add('图纸未声明单位（INSUNITS 读不到），下游工具可能按无单位处理')
+        } elseif ($unitInfo.code -eq 0) {
+            $warnings.Add('图纸单位为 unitless，跨软件传递时尺寸含义不确定')
+        }
+    }
+
+    if ($ExpectedUnits) {
+        $uc = Test-CadUnits -Path $dxfPath -Expected $ExpectedUnits
+        $report.unitsCheck = $uc
+        $evidence.Add($uc.evidence) | Out-Null
+        # match 是三值：只有 $false 是硬失败，$null 交给证据层变 needs_review。
+        if ($uc.match -eq $false) {
+            $checks.Add([pscustomobject]@{ name = "单位符合期望（$ExpectedUnits）"; pass = $false; detail = $uc.evidence.message }) | Out-Null
+        } elseif ($uc.match -eq $true) {
+            $checks.Add([pscustomobject]@{ name = "单位符合期望（$($unitInfo.name)）"; pass = $true }) | Out-Null
+        } else {
+            $warnings.Add($uc.evidence.message)
+        }
+    }
+
+    # ── 必需图层：存在 ≠ 有实体 ─────────────────────────────────
+    # 空图层零成本就能建出来，而按图层筛几何的下游（刀路、算量、
+    # 出图过滤）只认带实体的图层。
+    if ($RequiredLayers -and @($RequiredLayers).Count -gt 0) {
+        $ents = @(Get-CadDxfEntities -Path $dxfPath)
+        $lc = Test-CadRequiredLayers -Required $RequiredLayers -DxfPath $dxfPath -Entities $ents
+        $report.layersCheck = $lc
+        if ($lc.evidence) { $evidence.Add($lc.evidence) | Out-Null }
+        $checks.Add([pscustomobject]@{
+            name = if ($lc.pass) { "必需图层都有实体（$($lc.present.Count) 个）" }
+                   else { "必需图层缺实体（缺 $($lc.missing.Count) 个 / 空 $($lc.empty.Count) 个）" }
+            pass = [bool]$lc.pass
+        }) | Out-Null
+    }
+
     $report.status = if ($info.dxfValid) { 'ok' } else { 'invalid' }
 } catch {
     $report.status = 'failed'
     $report.error = $_.Exception.Message
 } finally {
     $report.warnings = $warnings.ToArray()
+    $report.evidence = $evidence.ToArray()
+    $report.checks = $checks.ToArray()
+    $failedChecks = @($checks | Where-Object { -not $_.pass })
+    if ($failedChecks.Count -gt 0) {
+        $report.error = ($failedChecks | ForEach-Object { $_.name }) -join '; '
+    }
+    $report.disposition = Get-CadDisposition -Checks $checks -Evidence $evidence `
+        -Warnings $warnings -Error $report.error `
+        -BlockedReason $(if ($report.status -eq 'invalid') { 'DXF 结构损坏，读不全就无法判断内容' } else { $null }) `
+        -Artifacts @([pscustomobject]@{ path = $report.path; exists = (Test-Path -LiteralPath $Path) })
+    $report.advice = Get-CadDispositionAdvice -Disposition $report.disposition
+    # 文件和 Draw 一样要区分：图纸本身没问题，只是验收条件没过。
+    if ($report.status -eq 'ok' -and $report.disposition -eq 'fail') {
+        $names = @($failedChecks | ForEach-Object { $_.name }) -join '、'
+        $report.advice = "这张图纸本身读取正常，是验收条件没满足：$names。" +
+            '核对 -ExpectedUnits / -RequiredLayers 是否写对，或换一张图再试。'
+    }
     $report.durationMs = [int]((Get-Date) - $started).TotalMilliseconds
     if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -164,15 +237,19 @@ try {
 }
 
 if ($AsJson) {
-    $report | ConvertTo-Json -Depth 8
+    $report | ConvertTo-Json -Depth 10
 } else {
     Write-Host ''
     Write-Host ('═' * 62)
     Write-Host ("  图纸体检  ·  {0}" -f $report.status)
+    if ($report.disposition) { Write-Host ("  结论    : {0}" -f $report.disposition) }
     Write-Host ('═' * 62)
     Write-Host ("  文件    : {0}" -f $report.path)
     Write-Host ("  格式    : {0}" -f $report.format)
     if ($report.version) { Write-Host ("  DXF 版本: {0}" -f $report.version) }
+    if ($report.units) {
+        Write-Host ("  单位    : {0}（INSUNITS={1}）" -f $report.units.name, $report.units.code)
+    }
     if ($null -ne $report.entityCount) { Write-Host ("  实体    : {0} 个" -f $report.entityCount) }
     if ($report.entityTypes) {
         Write-Host '  类型分布:'
@@ -197,7 +274,8 @@ if ($AsJson) {
         foreach ($w in $report.warnings) { Write-Host ("            ! {0}" -f $w) }
     }
     if ($report.error) { Write-Host ("  错误    : {0}" -f $report.error) }
+    if ($report.advice) { Write-Host ("  建议    : {0}" -f $report.advice) }
     Write-Host ('═' * 62)
 }
 
-if ($report.status -eq 'ok') { exit 0 } else { exit 1 }
+if ($report.status -eq 'ok' -and $report.disposition -ne 'fail') { exit 0 } else { exit 1 }

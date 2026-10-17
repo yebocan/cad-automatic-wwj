@@ -76,6 +76,10 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'CadCommon.ps1')
 . (Join-Path $PSScriptRoot 'CadCompiler.ps1')
+. (Join-Path $PSScriptRoot 'CadEvidence.ps1')
+. (Join-Path $PSScriptRoot 'CadSpecCheck.ps1')
+. (Join-Path $PSScriptRoot 'CadPdf.ps1')
+. (Join-Path $PSScriptRoot 'CadImage.ps1')
 
 $drawScript = Join-Path $PSScriptRoot 'Invoke-CadDraw.ps1'
 $inspectScript = Join-Path $PSScriptRoot 'Invoke-CadInspect.ps1'
@@ -239,6 +243,51 @@ $scenarios = @(
         expect  = 'block'
         assert  = '绝不能生成 (command "_.-BLOCK" …) —— 那样 -BLOCK 会停在「选择对象」把后续画图命令当选择点吃掉，卡到超时'
         timeout = 30
+    }
+    [pscustomobject]@{
+        name    = 'offline-spec-precheck'
+        title   = '出图前预检：不可能几何与约束冲突'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'errors'
+        assert  = '负半径、宽 0 的矩形、坐标溢出、重复 id 都必须被抓出来；合法 spec 必须零 errors'
+        timeout = 30
+    }
+    [pscustomobject]@{
+        name    = 'offline-units-layers'
+        title   = '单位与必需图层校验'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'classified'
+        assert  = 'INSUNITS 读数 + 中文单位名识别；图层必须分成 present/empty/missing 三类而不是一锅端'
+        timeout = 30
+    }
+    [pscustomobject]@{
+        name    = 'offline-manifest-diff'
+        title   = '清单比对：复现与差异检出'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'detects'
+        assert  = '同一份 spec 两次跑必须 identical；改 spec 内容、cadcore、实体数、产物哈希都必须被点名检出'
+        timeout = 30
+    }
+    [pscustomobject]@{
+        name    = 'offline-pdf-vector'
+        title   = 'PDF 矢量路径 → DXF'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'paths'
+        assert  = '内容流必须解析出路径、坐标必须落在 MediaBox 内（CTM 不能丢）；纯位图 PDF 必须明确报「没有矢量内容」而不是吐一堆垃圾'
+        timeout = 30
+    }
+    [pscustomobject]@{
+        name    = 'offline-image-probe'
+        title   = '图片预检：格式/尺寸/空白/暗点统计'
+        mock    = $null
+        modes   = @('offline')
+        expect  = 'stats'
+        assert  = '必须给出尺寸、格式、空白比例、暗点计数，并对纯白图与过小图给出可操作的警告'
+        timeout = 60
     }
 )
 
@@ -558,6 +607,300 @@ function Invoke-OfflineScenario {
                 Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' -Passed $false `
                     -Expected '编译成功' -Actual "throws: $($_.Exception.Message)"
             }
+        }
+
+        'offline-spec-precheck' {
+            # 出图前预检的意义：把「必然失败」和「可能要人工看一眼」在
+            # 启动 accoreconsole 之前就分开。跑到一半再失败最贵 ——
+            # 一次 accoreconsole 启动要 1–2 秒，出图全流程 4 秒多。
+            $specOk = [ordered]@{
+                units    = 'mm'
+                entities = @(
+                    [ordered]@{ type = 'rect'; p1 = @(0, 0); p2 = @(100, 50) },
+                    [ordered]@{ type = 'circle'; c = @(50, 25); r = 10 }
+                )
+            }
+            $rOk = Test-CadSpecStrict -Spec $specOk
+
+            $specBad = [ordered]@{
+                units    = 'mm'
+                entities = @(
+                    [ordered]@{ type = 'circle'; c = @(0, 0); r = -5 },
+                    [ordered]@{ type = 'rect'; p1 = @(0, 0); p2 = @(0, 50) },
+                    [ordered]@{ type = 'line'; p1 = @(0, 0); p2 = @(5e7, 0) }
+                )
+            }
+            $rBad = Test-CadSpecStrict -Spec $specBad
+            $badText = ($rBad.errors -join ' ')
+
+            # 重复 id：同一个图元被引用两次时下游无法定位
+            $specDup = [ordered]@{
+                units    = 'mm'
+                entities = @(
+                    [ordered]@{ id = 'hole1'; type = 'circle'; c = @(0, 0); r = 5 },
+                    [ordered]@{ id = 'hole1'; type = 'circle'; c = @(20, 0); r = 5 }
+                )
+            }
+            $rDup = Test-CadSpecStrict -Spec $specDup
+
+            # constraints：maxEntities 超限必须拦住
+            $specMax = [ordered]@{
+                units       = 'mm'
+                constraints = [ordered]@{ maxEntities = 1 }
+                entities    = @(
+                    [ordered]@{ type = 'circle'; c = @(0, 0); r = 5 },
+                    [ordered]@{ type = 'circle'; c = @(20, 0); r = 5 }
+                )
+            }
+            $rMax = Test-CadSpecStrict -Spec $specMax
+
+            $negR   = $badText -match '大于 0'
+            $zeroW  = $badText -match '宽度为 0'
+            $over   = $badText -match '溢出|超出|过大'
+            $dupId  = (-not $rDup.ok) -and (($rDup.errors -join ' ') -match 'hole1')
+            $maxHit = (-not $rMax.ok) -and (($rMax.errors -join ' ') -match 'maxEntities')
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed ($rOk.ok -and $negR -and $zeroW -and $over -and $dupId -and $maxHit) `
+                -Expected '合法 spec 零 errors；负半径/宽 0/溢出/重复 id/maxEntities 全部命中' `
+                -Actual "ok.errors=$(@($rOk.errors).Count) 负=$negR 宽0=$zeroW 溢出=$over 重复id=$dupId max=$maxHit" `
+                -Detail "badErrors: $badText"
+        }
+
+        'offline-units-layers' {
+            # 图层三分类：present / empty / missing
+            # 自造一份 DXF：GEO 有实体，GHOST 只有声明，NOWHERE 连声明都没有。
+            # ★ fixture 必须有 0=SECTION 起始行，且不能带 UTF-8 BOM ★
+            # （BOM 会让 Read-CadDxfPairs 把 (0,SECTION) 连同值一起跳过，
+            #   TABLES 段整个读不到 —— 那是读端已修的坑，这里用 UTF8Encoding($false)）
+            $dxfPath = Join-Path $Dir 'layers.dxf'
+            $dxfLines = @(
+                '0', 'SECTION', '2', 'HEADER',
+                '9', '$ACADVER', '1', 'AC1015',
+                '9', '$INSUNITS', '70', '4',
+                '9', '$EXTMIN', '10', '0.0', '20', '0.0', '30', '0.0',
+                '9', '$EXTMAX', '10', '100.0', '20', '60.0', '30', '0.0',
+                '0', 'ENDSEC',
+                '0', 'SECTION', '2', 'TABLES',
+                '0', 'LAYER', '2', 'GEO', '70', '0', '62', '7', '6', 'CONTINUOUS',
+                '0', 'LAYER', '2', 'GHOST', '70', '0', '62', '7', '6', 'CONTINUOUS',
+                '0', 'ENDTAB',
+                '0', 'ENDSEC',
+                '0', 'SECTION', '2', 'ENTITIES',
+                '0', 'LINE', '8', 'GEO', '10', '0.0', '20', '0.0', '30', '0.0', '11', '100.0', '21', '60.0', '31', '0.0',
+                '0', 'ENDSEC',
+                '0', 'EOF'
+            )
+            [IO.File]::WriteAllText($dxfPath, ($dxfLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+            # 单位：DXF 的 $INSUNITS 只有数字，映射成人看得懂的名字 + mm 倍数。
+            # ★ Get-CadDrawingUnits 吃的是 -Path（一张 DXF），不是 -Units ★
+            # 「mm/毫米/furlong 认不认」是 Get-CadUnitCode / Test-CadUnits -Expected 的事，
+            # 前者按名字查表，后者按名字与图纸比对。
+            $u = Get-CadDrawingUnits -Path $dxfPath
+            $uCode = $u.code
+            $uName = "$($u.name)"
+            $uMm   = $u.unitToMm
+            # 中文单位名也要认 —— spec 是人写的，写「毫米」很自然
+            $uCnOk = ((Get-CadUnitCode -Name '毫米') -eq 4)
+            # unitless / 认不出 / 读不到必须区分
+            $uNoneCode = Get-CadUnitCode -Name 'unitless'
+            $uBad  = Get-CadUnitCode -Name 'furlong'
+
+            $lay = Test-CadRequiredLayers -Required @('GEO', 'GHOST', 'NOWHERE') -DxfPath $dxfPath
+            $hasGeo   = @($lay.present) -contains 'GEO'
+            $hasGhost = @($lay.empty) -contains 'GHOST'
+            $hasNowh  = @($lay.missing) -contains 'NOWHERE'
+            $notPass  = ($lay.pass -eq $false)
+
+            # 单位一致 / 不一致（Test-CadUnits 吃 -Path + -Expected，不是 ActualCode）
+            $uMatch = (Test-CadUnits -Path $dxfPath -Expected 'mm').match
+            $uMiss  = (Test-CadUnits -Path $dxfPath -Expected 'm').match
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed ($uCode -eq 4 -and $uName -match 'mm|毫米' -and $uMm -eq 1 -and $uCnOk -and $uBad -lt 0 -and $uNoneCode -eq 0 -and $hasGeo -and $hasGhost -and $hasNowh -and $notPass -and ($uMatch -eq $true) -and ($uMiss -eq $false)) `
+                -Expected 'units=mm(code4,toMm=1)；中文「毫米」认得；unitless→0、furlong→<0；图层三类分清' `
+                -Actual "code=$uCode name=$uName toMm=$uMm 毫米=$uCnOk furlong=$uBad unitless=$uNoneCode GEO=$hasGeo GHOST=$hasGhost NOWHERE=$hasNowh 单位匹配=$uMatch/$uMiss"
+        }
+
+        'offline-manifest-diff' {
+            $specPath = Join-Path $Dir 'man-spec.json'
+            $specBody = [ordered]@{
+                units    = 'mm'
+                entities = @([ordered]@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) })
+            }
+            [IO.File]::WriteAllText($specPath, ($specBody | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+
+            $artPath = Join-Path $Dir 'artifact.dwg'
+            [IO.File]::WriteAllBytes($artPath, ([byte[]](1..128)))
+
+            $mk = {
+                param([int]$EntCount, [string]$SpecText)
+                $sp = Join-Path $Dir "s-$EntCount.json"
+                [IO.File]::WriteAllText($sp, $SpecText, (New-Object System.Text.UTF8Encoding($false)))
+                New-CadManifest -SpecFile $sp -Spec $specBody -DrawingName 'probe' `
+                    -Artifacts @(@{ kind = 'dwg'; path = $artPath }) `
+                    -Evidence @(New-CadEvidence -Kind 't' -Level 'known' -Message 'm' -Source 'run-scenario') `
+                    -Disposition 'pass' -Units 'mm' -UnitsCode 4 -EntityCount $EntCount -Layers @('GEO')
+            }
+
+            $a = & $mk 1 '{"units":"mm","entities":[{"type":"line","p1":[0,0],"p2":[10,0]}]}'
+            $b = & $mk 1 '{"units":"mm","entities":[{"type":"line","p1":[0,0],"p2":[10,0]}]}'
+            $same = Compare-CadManifest -Before $a -After $b
+
+            # 改 spec 文本 → specSha256 必须变
+            $c = & $mk 1 '{"units":"mm","entities":[{"type":"line","p1":[0,0],"p2":[99,0]}]}'
+            $diffSpec = Compare-CadManifest -Before $a -After $c
+
+            # 改实体数 → entityCount 必须被点名
+            $d = & $mk 7 '{"units":"mm","entities":[{"type":"line","p1":[0,0],"p2":[10,0]}]}'
+            $diffEnt = Compare-CadManifest -Before $a -After $d
+
+            # 改产物字节 → 产物 sha256 必须变
+            [IO.File]::WriteAllBytes($artPath, ([byte[]](9..136)))
+            $e = & $mk 1 '{"units":"mm","entities":[{"type":"line","p1":[0,0],"p2":[10,0]}]}'
+            $diffArt = Compare-CadManifest -Before $a -After $e
+
+            $fields = @($diffSpec.diffs | ForEach-Object { $_.field }) -join ','
+            $entFields = @($diffEnt.diffs | ForEach-Object { $_.field }) -join ','
+            $artFields = @($diffArt.diffs | ForEach-Object { $_.field }) -join ','
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed ($same.identical -and (-not $diffSpec.identical) -and $fields -match 'specSha256' -and $entFields -match 'entityCount' -and $artFields -match 'sha256') `
+                -Expected '同 spec identical；改 spec/实体数/产物分别命中 specSha256 / entityCount / artifacts sha256' `
+                -Actual "same=$($same.identical) spec=[$fields] ent=[$entFields] art=[$artFields]"
+        }
+
+        'offline-pdf-vector' {
+            # 自造一份未压缩内容流的 PDF：一条折线 + 一个矩形，只描边。
+            # 不用 Flate —— 避免把「压缩流能不能解」混进「矢量解析对不对」。
+            $content = "1 0 0 RG 1 w`n10 10 m 100 10 l 100 60 l 10 60 l s`n120 10 40 40 re S`n"
+            $cb = [Text.Encoding]::ASCII.GetBytes($content)
+            $objs = New-Object System.Collections.Generic.List[string]
+            $objs.Add('1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj')
+            $objs.Add('2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj')
+            $objs.Add('3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R>>endobj')
+            $objs.Add("4 0 obj<</Length $($cb.Length)>>stream`n$($content)endstream endobj")
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('%PDF-1.4' + "`n")
+            $offsets = New-Object System.Collections.Generic.List[int]
+            $bodySb = New-Object System.Text.StringBuilder
+            for ($i = 0; $i -lt $objs.Count; $i++) {
+                $offsets.Add($sb.Length + $bodySb.Length) | Out-Null
+                [void]$bodySb.Append($objs[$i] + "`n")
+            }
+            [void]$sb.Append($bodySb.ToString())
+            $xrefPos = $sb.Length
+            [void]$sb.Append("xref`n0 $($objs.Count + 1)`n0000000000 65535 f `n")
+            foreach ($off in $offsets) { [void]$sb.Append(("{0:d10} 00000 n `n" -f $off)) }
+            [void]$sb.Append("trailer<</Size $($objs.Count + 1)/Root 1 0 R>>`nstartxref`n$xrefPos`n%%EOF`n")
+
+            $pdfPath = Join-Path $Dir 'vector.pdf'
+            [IO.File]::WriteAllBytes($pdfPath, [Text.Encoding]::ASCII.GetBytes($sb.ToString()))
+
+            $info = Get-CadPdfInfo -Path $pdfPath
+            $outDxf = Join-Path $Dir 'vector.dxf'
+            $r = Convert-CadPdfToDxf -Path $pdfPath -Output $outDxf
+
+            $mb = @($info.mediaBox)
+            $inBox = $true
+            if ($r.extents) {
+                $minX = [double]$r.extents.minX; $minY = [double]$r.extents.minY
+                $maxX = [double]$r.extents.maxX; $maxY = [double]$r.extents.maxY
+                $inBox = ($minX -ge -0.5) -and ($minY -ge -0.5) -and ($maxX -le 200.5) -and ($maxY -le 100.5)
+            }
+            $dxfOk = (Test-Path -LiteralPath $outDxf) -and ((Get-Item -LiteralPath $outDxf).Length -gt 512)
+            $chk = $null
+            if ($dxfOk) { $chk = Test-CadDxfFile -Path $outDxf }
+
+            # 位图 PDF：只有 DCTDecode 图像，没有矢量内容 → 必须明确说「没有」
+            # 而不是吐一堆垃圾或静默成功。用纯文本伪 PDF 触媒（头对、无内容流）。
+            $badPdf = Join-Path $Dir 'scan.pdf'
+            [IO.File]::WriteAllBytes($badPdf, ([Text.Encoding]::ASCII.GetBytes('%PDF-1.4' + "`n" + ('x' * 3000) + "`n%%EOF`n")))
+            $rBad = $null; $errText = ''
+            try { $rBad = Convert-CadPdfToDxf -Path $badPdf } catch { $errText = $_.Exception.Message }
+
+            $noVector = ($null -eq $rBad -and $errText -match '矢量|OCR|矢量化') -or `
+                        ($rBad -and $rBad.status -eq 'empty')
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed (($r.status -eq 'ok') -and ($r.pathCount -ge 2) -and $inBox -and $dxfOk -and ($chk -and $chk.valid) -and $noVector) `
+                -Expected '解析出 ≥2 条路径、坐标在 MediaBox 内、DXF 结构有效；位图 PDF 明确报「无矢量内容」' `
+                -Actual "status=$($r.status) paths=$($r.pathCount) inBox=$inBox dxf=$dxfOk valid=$($chk.valid) 位图识别=$noVector"
+        }
+
+        'offline-image-probe' {
+            # 图片预检：给图片→CAD 那条链做第一道筛子。
+            # 必须在启动任何东西之前就告诉用户「这张图没有线稿」，
+            # 而不是等 CAD 跑完才发现画出来一片空白。
+            $imgDir = Join-Path $Dir 'img'
+            New-Item -ItemType Directory -Path $imgDir -Force | Out-Null
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+
+            # 纯白图：有尺寸但没有任何内容
+            $whitePath = Join-Path $imgDir 'white.png'
+            $bmpW = New-Object System.Drawing.Bitmap(120, 80)
+            $g = [System.Drawing.Graphics]::FromImage($bmpW)
+            $g.Clear([System.Drawing.Color]::White)
+            $g.Dispose()
+            $bmpW.Save($whitePath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpW.Dispose()
+
+            # 有线稿的图：白底 + 一条黑色横线
+            $linePath = Join-Path $imgDir 'line.png'
+            $bmpL = New-Object System.Drawing.Bitmap(120, 80)
+            $g2 = [System.Drawing.Graphics]::FromImage($bmpL)
+            $g2.Clear([System.Drawing.Color]::White)
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 2)
+            $g2.DrawLine($pen, 10, 40, 110, 40)
+            $pen.Dispose(); $g2.Dispose()
+            $bmpL.Save($linePath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpL.Dispose()
+
+            # 墨迹统计在 Get-CadImageInk 里（字段是 inkRatio / inkPixels /
+            # bounds），不是 Get-CadImageInfo —— 那个只报尺寸与格式。
+            # 「能不能用」的结论在 Test-CadImageUsable 里（字段是 ok / issues /
+            # advice），也没有 warnings。
+            $iw = Get-CadImageInk -Path $whitePath
+            $il = Get-CadImageInk -Path $linePath
+            $ow = Get-CadImageInfo -Path $whitePath
+            $ol = Get-CadImageInfo -Path $linePath
+            $uw = Test-CadImageUsable -Path $whitePath -MinWidth 8 -MinHeight 8 -MinInkRatio 0.002
+
+            $dimsOk = ($ow.width -eq 120 -and $ow.height -eq 80 -and $ol.width -eq 120)
+            $fmtOk   = ("$($ow.format)" -match 'png|Png|PNG')
+            # 纯白图的墨迹比例必须接近 0，有线稿的必须明显大于 0
+            $whiteRatio = [double]$iw.inkRatio
+            $lineRatio  = [double]$il.inkRatio
+            $blankOk = ($whiteRatio -lt 0.01) -and ($lineRatio -gt 0.01)
+            $darkOk  = ([int]$iw.inkPixels -lt 50) -and ([int]$il.inkPixels -gt 50)
+            # 有线稿的图必须给出包围盒，纯白图不该有
+            $boundsOk = ($null -eq $iw.bounds) -and ($null -ne $il.bounds)
+            # 纯白图必须被判定「不可用」并给出理由
+            $warnOk = ($uw.ok -eq $false -and @($uw.issues).Count -gt 0)
+
+            # 不存在的文件必须报错而不是返回一份假统计
+            $missingOk = $false
+            try {
+                $mo = Get-CadImageInfo -Path (Join-Path $imgDir 'nope.png')
+                $missingOk = ($mo.valid -eq $false -and "$($mo.reason)" -ne '')
+            } catch { $missingOk = $true }
+
+            # 太小的图：尺寸小到不可能承载一张零件图（默认阈值 200×200）
+            $tinyPath = Join-Path $imgDir 'tiny.png'
+            $bmpT = New-Object System.Drawing.Bitmap(8, 8)
+            $g3 = [System.Drawing.Graphics]::FromImage($bmpT)
+            $g3.Clear([System.Drawing.Color]::White)
+            $g3.Dispose()
+            $bmpT.Save($tinyPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpT.Dispose()
+            $ut = Test-CadImageUsable -Path $tinyPath
+            $tinyOk = ($ut.ok -eq $false -and @($ut.issues).Count -gt 0)
+
+            Add-Result -Name $Scenario.name -Title $Scenario.title -Mode 'offline' `
+                -Passed ($dimsOk -and $fmtOk -and $blankOk -and $darkOk -and $boundsOk -and $warnOk -and $missingOk -and [bool]$tinyOk) `
+                -Expected '尺寸/格式正确；墨迹比与墨点数区分有线稿与纯白；有线稿有包围盒；纯白/过小/不可读都判定不可用并给理由' `
+                -Actual "dims=$dimsOk fmt=$fmtOk ink=$blankOk($whiteRatio/$lineRatio) px=$darkOk($iw.inkPixels/$il.inkPixels) bounds=$boundsOk 白图不可用=$warnOk 不可读=$missingOk tiny=$tinyOk"
         }
 
         default {

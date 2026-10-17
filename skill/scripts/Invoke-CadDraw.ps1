@@ -38,7 +38,17 @@ param(
     [int]$TimeoutSeconds = 180,
     # 显式指定 accoreconsole。留空则走 5 级解析链（参数→环境变量→配置→扫盘→PATH）。
     # 测试用它把假 accoreconsole 注进来，避免污染 CAD_ACCORECONSOLE 环境变量。
-    [string]$AccoreConsole
+    [string]$AccoreConsole,
+    # 跳过出图前的 spec 静态预检（只给「明知道 spec 有问题也要硬画」的场景用）
+    [switch]$SkipPrecheck,
+    # 出图后额外校验：图纸单位必须是这个（如 mm）
+    [string]$ExpectedUnits,
+    # 出图后额外校验：这些图层上必须真的有实体
+    [string[]]$RequiredLayers,
+    # 清单路径。留空则写到 <OutputDir>\manifest.json；给 '' 则不写清单
+    [string]$Manifest,
+    # 已有的清单文件，用来比对两次运行是否一致
+    [string]$CompareManifest
 )
 
 Set-StrictMode -Version Latest
@@ -47,19 +57,27 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'CadCommon.ps1')
 . (Join-Path $scriptDir 'CadCompiler.ps1')
+. (Join-Path $scriptDir 'CadEvidence.ps1')
+. (Join-Path $scriptDir 'CadSpecCheck.ps1')
 
 function Write-CadReport {
     param($Report, [switch]$Json)
     if ($Json) {
-        $Report | ConvertTo-Json -Depth 8
+        $Report | ConvertTo-Json -Depth 10
     } else {
         Write-Host ''
         Write-Host ('═' * 62)
         Write-Host ("  cad-automatic-wwj  ·  {0}" -f $Report.status)
+        if ($Report.disposition) {
+            Write-Host ("  结论    : {0}" -f $Report.disposition)
+        }
         Write-Host ('═' * 62)
         if ($Report.drawing) { Write-Host ("  图纸    : {0}" -f $Report.drawing) }
         if ($null -ne $Report.entityCount) { Write-Host ("  实体    : {0} 个" -f $Report.entityCount) }
         if ($Report.layers) { Write-Host ("  图层    : {0}" -f ($Report.layers -join ', ')) }
+        if ($Report.units -and $Report.units.name) {
+            Write-Host ("  单位    : {0}（INSUNITS={1}）" -f $Report.units.name, $Report.units.code)
+        }
         if ($Report.artifacts) {
             Write-Host '  产物    :'
             foreach ($a in $Report.artifacts) {
@@ -75,6 +93,7 @@ function Write-CadReport {
             foreach ($c in $Report.checks) {
                 $mark = if ($c.pass) { '✓' } else { '✗' }
                 Write-Host ("            {0} {1}" -f $mark, $c.name)
+                if (-not $c.pass -and $c.detail) { Write-Host ("              {0}" -f $c.detail) }
             }
         }
         if ($Report.warnings -and @($Report.warnings).Count -gt 0) {
@@ -82,6 +101,12 @@ function Write-CadReport {
             foreach ($w in $Report.warnings) { Write-Host ("            ! {0}" -f $w) }
         }
         if ($Report.error) { Write-Host ("  错误    : {0}" -f $Report.error) }
+        if ($Report.advice) { Write-Host ("  建议    : {0}" -f $Report.advice) }
+        if ($Report.manifest) { Write-Host ("  清单    : {0}" -f $Report.manifest) }
+        if ($Report.compare) {
+            $cmpText = if ($Report.compare.identical) { '与基线一致' } else { "与基线有 $($Report.compare.diffCount) 处差异" }
+            Write-Host ("  复现    : {0}" -f $cmpText)
+        }
         if ($Report.logDir) { Write-Host ("  日志    : {0}" -f $Report.logDir) }
         Write-Host ('═' * 62)
     }
@@ -101,8 +126,14 @@ function Invoke-CadDraw {
     $started = Get-Date
     $warnings = New-Object System.Collections.Generic.List[string]
     $checks = New-Object System.Collections.Generic.List[object]
+    $evidence = New-Object System.Collections.Generic.List[object]
     $report = [ordered]@{
         status      = 'unknown'
+        # disposition 是给人看的五态结论，status 是给脚本看的机器状态。
+        # 两者不合并：status 只有 ok/partial/failed/dry-run/blocked 五个值，
+        # 而 disposition 要区分「有证据通过」和「只是没发现错」。
+        disposition = $null
+        advice      = $null
         drawing     = $null
         entityCount = $null
         layers      = @()
@@ -117,6 +148,12 @@ function Invoke-CadDraw {
         exitName    = $null
         timedOut    = $false
         markers     = [ordered]@{}
+        units       = $null
+        unitsCheck  = $null
+        layersCheck = $null
+        evidence    = @()
+        manifest    = $null
+        compare     = $null
         durationMs  = $null
     }
 
@@ -136,6 +173,41 @@ function Invoke-CadDraw {
         if ($null -eq $spec) { throw 'JSON 解析结果为空' }
 
         $report.drawing = [string](Get-CadField $spec 'name' 'drawing')
+
+        # ── 1.5 出图前静态预检 ───────────────────────────────────
+        # accoreconsole 出图一次 4 秒，失败一次要等超时（默认 180 秒）。
+        # 而绝大多数失败根本不需要 AutoCAD 参与判断：circle 少了 r、
+        # rect 两个角点重合、螺栓阵列 count=0 —— 纯数据问题，本地几毫秒能判。
+        #
+        # ★ 更重要的是「画成功了但画错了」★
+        #   半径 -20 会报错，但半径 20000 会得到一张 20 米宽的图纸，
+        #   成果看起来完整、尺寸全错。那才是真正会流到下游的灾难。
+        #   预检就是拦这一类：坐标溢出 ±1e7、包络超限、间隙不足。
+        if (-not $SkipPrecheck) {
+            $pre = Test-CadSpecStrict -Spec $spec
+            foreach ($w in $pre.warnings) { $warnings.Add($w) }
+            if ($pre.evidence) { foreach ($e in $pre.evidence) { $evidence.Add($e) } }
+
+            $checks.Add([pscustomobject]@{
+                name   = "出图前预检（$($pre.stats.entityCount) 实体 / $($pre.stats.layerCount) 图层）"
+                pass   = [bool]$pre.ok
+                detail = if ($pre.ok) { '' } else { "阻断性错误 $($pre.errors.Count) 条" }
+                scope  = 'verdict'
+            }) | Out-Null
+
+            if (-not $pre.ok) {
+                # 一个实体都不画。让用户改 spec，而不是让他在 DWG 里找哪儿错了。
+                $report.disposition = 'blocked'
+                $report.advice = Get-CadDispositionAdvice -Disposition 'blocked'
+                $report.status = 'blocked'
+                $report.error = 'spec 预检未通过：' + ($pre.errors -join '; ')
+                $report.checks = $checks.ToArray()
+                $report.warnings = $warnings.ToArray()
+                $report.evidence = $evidence.ToArray()
+                $report.durationMs = [int]((Get-Date) - $started).TotalMilliseconds
+                return $report
+            }
+        }
 
         # ── 2. 准备状态与工作目录 ────────────────────────────────
         Initialize-CadState | Out-Null
@@ -264,7 +336,13 @@ function Invoke-CadDraw {
         $checks.Add([pscustomobject]@{ name = 'LISP 已生成（GBK）'; pass = $true }) | Out-Null
 
         if ($DryRun) {
+            # DryRun 只跑到编译层。产物层证据一条都没有，
+            # 所以结论不可能是 pass —— 让证据层自己说 needs_review，
+            # 而不是留个空 disposition 让调用方以为「没结论就是没事」。
             $report.status = 'dry-run'
+            $report.evidence = $evidence.ToArray()
+            $report.disposition = 'needs_review'
+            $report.advice = '只做了出图前预检与 LISP 生成，没有真正执行；确认无误后去掉 -DryRun 再跑。'
             $report.checks = $checks.ToArray()
             $report.warnings = $warnings.ToArray()
             $report.durationMs = [int]((Get-Date) - $started).TotalMilliseconds
@@ -402,21 +480,155 @@ function Invoke-CadDraw {
             }
         }
 
+        # ── 7.5 单位校验（有 DXF 才做）────────────────────────────
+        # 为什么放在产物校验之后：单位的证据来自 DXF 头，没有产物就无从谈起。
+        # 为什么单位这么重要：一个 100×60 的矩形，INSUNITS=4 是垫片，
+        # INSUNITS=6 是地块。DXF 字节几乎一样、实体数完全一样、屏幕上比例
+        # 也一样，唯一能区分的就是 $INSUNITS。
+        if ($dxfPath -and (Test-Path -LiteralPath $dxfPath -PathType Leaf)) {
+            $unitInfo = Get-CadDrawingUnits -Path $dxfPath
+            $report.units = [pscustomobject]@{
+                code = $unitInfo.code
+                name = $unitInfo.name
+            }
+            $evidence.Add($unitInfo.evidence) | Out-Null
+
+            if ($ExpectedUnits) {
+                $uc = Test-CadUnits -Path $dxfPath -Expected $ExpectedUnits
+                $report.unitsCheck = $uc
+                $evidence.Add($uc.evidence) | Out-Null
+                # match 是三值：$true / $false / $null(不知道)
+                # 只有 $false 才是失败断言；$null 交给证据层把它拉成 needs_review。
+                if ($uc.match -eq $false) {
+                    $checks.Add([pscustomobject]@{
+                        name   = "单位符合期望（$ExpectedUnits）"
+                        pass   = $false
+                        detail = $uc.evidence.message
+                        scope  = 'verdict'
+                    }) | Out-Null
+                } elseif ($uc.match -eq $true) {
+                    $checks.Add([pscustomobject]@{
+                        name  = "单位符合期望（$($unitInfo.name)）"
+                        pass  = $true
+                        scope = 'verdict'
+                    }) | Out-Null
+                } else {
+                    $warnings.Add($uc.evidence.message)
+                }
+            }
+        }
+
+        # ── 7.6 必需图层的覆盖校验 ───────────────────────────────
+        # 图层存在 ≠ 几何画在上面。空图层零成本就能建出来，
+        # 而下游按图层筛几何（CAM 刀路、算量、出图过滤）只认后者。
+        if ($RequiredLayers -and @($RequiredLayers).Count -gt 0) {
+            $ents = @()
+            if ($dxfPath -and (Test-Path -LiteralPath $dxfPath -PathType Leaf)) {
+                $ents = @(Get-CadDxfEntities -Path $dxfPath)
+            }
+            $lc = Test-CadRequiredLayers -Required $RequiredLayers -DxfPath $dxfPath -Entities $ents
+            $report.layersCheck = $lc
+            if ($lc.evidence) { $evidence.Add($lc.evidence) | Out-Null }
+            $checks.Add([pscustomobject]@{
+                name  = if ($lc.pass) { "必需图层都有实体（$($lc.present.Count) 个）" }
+                        else { "必需图层缺实体（缺 $($lc.missing.Count) 个 / 空 $($lc.empty.Count) 个）" }
+                pass  = [bool]$lc.pass
+                scope = 'verdict'
+            }) | Out-Null
+        }
+
         $report.artifacts = $artifacts.ToArray()
         $report.checks = $checks.ToArray()
         $report.warnings = $warnings.ToArray()
+        $report.evidence = $evidence.ToArray()
 
-        $failed = @($checks | Where-Object { -not $_.pass })
-        $report.status = if ($failed.Count -eq 0) { 'ok' } elseif ($doneMarker) { 'partial' } else { 'failed' }
-        if ($failed.Count -gt 0) {
-            $report.error = ($failed | ForEach-Object { $_.name }) -join '; '
+        # ── status 与 disposition 是两件事，别混 ─────────────────
+        #   status      执行/产物状态：图到底画出来没有。只看「产物层」检查
+        #               （编译、执行、DWG/DXF/PDF 结构、统计数）。
+        #   disposition 验收结论：这批产物能不能交。看**全部**检查 + 证据。
+        #
+        # 分开的理由：单位不符时三个产物都在、结构都完好，status 就该是 ok
+        # （确实画出来了），但 disposition 必须是 fail（交出去会把 100mm 当
+        # 100m 用）。以前两者都从 failed.Count 推，于是 status=partial 与
+        # disposition=fail 同时出现，读报告的人以为「画了一半」。
+        $artifactFailed = @($checks | Where-Object { -not $_.pass -and $_.scope -ne 'verdict' })
+        $report.status = if ($artifactFailed.Count -eq 0) { 'ok' } elseif ($doneMarker) { 'partial' } else { 'failed' }
+        # error 里要把验收类失败也写上：status=ok 但 disposition=fail 时，
+        # 用户看到 advice 让他「先看 error」，error 却是空的就自相矛盾了。
+        $failedAll = @($checks | Where-Object { -not $_.pass })
+        if ($failedAll.Count -gt 0) {
+            $report.error = ($failedAll | ForEach-Object { $_.name }) -join '; '
+        }
+
+        # ── 7.7 五态结论 ─────────────────────────────────────────
+        $report.disposition = Get-CadDisposition -Checks $checks -Evidence $evidence `
+            -Warnings $warnings -Error $report.error -Artifacts $artifacts
+        $report.advice = Get-CadDispositionAdvice -Disposition $report.disposition
+
+        # 「图出来了但验收不过」是个容易误读的组合：
+        #   status=ok 说明产物没问题，disposition=fail 说明不能交。
+        # 通用建议（「执行或产物校验失败」）会把人引去查产物，白跑一趟。
+        if ($report.status -eq 'ok' -and $report.disposition -eq 'fail') {
+            $verdictNames = @($failedAll | ForEach-Object { $_.name }) -join '、'
+            $report.advice = "图纸与产物都已生成并通过结构校验，是验收条件没满足：$verdictNames。" +
+                '按需改 spec，或调整 -ExpectedUnits / -RequiredLayers 后重跑；产物本身可以直接打开检查。'
+        }
+
+        # ── 7.8 清单落盘 + 复现比对 ───────────────────────────────
+        # 清单把「这次运行到底是什么」钉成可复现的记录：
+        # spec 哈希、cadcore 哈希、每个产物的哈希。同一份 spec 跑两次，
+        # 哈希一致才说明产物真的相同，而不是「看起来差不多」。
+        $manifestPath = $Manifest
+        if (-not $PSBoundParameters.ContainsKey('Manifest')) {
+            $manifestPath = Join-Path $OutputDir 'manifest.json'
+        }
+        if ($manifestPath) {
+            $dwgInfoForManifest = $null
+            $extInfo = $null
+            if ($dxfPath -and (Test-Path -LiteralPath $dxfPath -PathType Leaf)) {
+                $extInfo = Get-CadExtentSize -Path $dxfPath
+            }
+            $specSha = if ($SpecFile) { Get-CadSha256 -Path $SpecFile } else { $null }
+            $mf = New-CadManifest -SpecFile $SpecFile -DrawingName $report.drawing `
+                -Artifacts $artifacts -Evidence $evidence -Disposition $report.disposition `
+                -AccoreConsole $accore -AccoreConsoleSource $accoreInfo.source `
+                -CadCorePath $coreWork -Units $report.units.name -UnitsCode $report.units.code `
+                -Extents $extInfo -EntityCount $compiled.entityCount -Layers $compiled.layers `
+                -SpecSha256 $specSha
+            $written = if ([IO.Path]::IsPathRooted($manifestPath)) { $manifestPath }
+                       else { Join-Path $OutputDir $manifestPath }
+            $saved = Write-CadManifest -Manifest $mf -Path $written
+            if ($saved) {
+                $report.manifest = $saved
+            } else {
+                $warnings.Add("清单写入失败: $written")
+                $report.warnings = $warnings.ToArray()
+            }
+
+            if ($CompareManifest -and $saved -and (Test-Path -LiteralPath $CompareManifest -PathType Leaf)) {
+                try {
+                    $before = Get-Content -LiteralPath $CompareManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $report.compare = Compare-CadManifest -Before $before -After $mf
+                    if (-not $report.compare.identical) {
+                        $warnings.Add("与基线清单不一致（$($report.compare.diffCount) 处）：" +
+                            (($report.compare.diffs | ForEach-Object { "$($_.field): $($_.before) → $($_.after)" }) -join '; '))
+                        $report.warnings = $warnings.ToArray()
+                    }
+                } catch {
+                    $warnings.Add("基线清单读取失败: $($_.Exception.Message)")
+                    $report.warnings = $warnings.ToArray()
+                }
+            }
         }
 
     } catch {
         $report.status = 'failed'
+        $report.disposition = 'fail'
+        $report.advice = Get-CadDispositionAdvice -Disposition 'fail'
         $report.error = $_.Exception.Message
         $report.checks = $checks.ToArray()
         $report.warnings = $warnings.ToArray()
+        $report.evidence = $evidence.ToArray()
     } finally {
         $report.durationMs = [int]((Get-Date) - $started).TotalMilliseconds
         # 清理工作目录（日志保留在 logDir 里，除非要求保留全部）
@@ -431,12 +643,34 @@ function Invoke-CadDraw {
 }
 
 # ── 入口 ──────────────────────────────────────────────────────────
-$result = Invoke-CadDraw -SpecFile $SpecFile -SpecJson $SpecJson -OutputDir $OutputDir `
-    -Dwg $Dwg -DryRun:$DryRun -KeepArtifacts:$KeepArtifacts -TimeoutSeconds $TimeoutSeconds `
-    -AccoreConsole $AccoreConsole
+$drawArgs = @{
+    SpecFile        = $SpecFile
+    SpecJson        = $SpecJson
+    OutputDir       = $OutputDir
+    Dwg             = $Dwg
+    DryRun          = $DryRun
+    KeepArtifacts   = $KeepArtifacts
+    TimeoutSeconds  = $TimeoutSeconds
+    AccoreConsole   = $AccoreConsole
+    SkipPrecheck    = $SkipPrecheck
+    ExpectedUnits   = $ExpectedUnits
+    RequiredLayers  = $RequiredLayers
+    CompareManifest = $CompareManifest
+}
+# Manifest 单独处理：空串是「不写清单」的有效取值，
+# 不能因为 $Manifest 是 '' 就当成「没传」而落回默认路径。
+if ($PSBoundParameters.ContainsKey('Manifest')) { $drawArgs.Manifest = $Manifest }
+
+$result = Invoke-CadDraw @drawArgs
 
 Write-CadReport -Report $result -Json:$AsJson
 
-if ($result.status -in @('ok', 'dry-run')) { exit 0 }
+if ($result.status -in @('ok', 'dry-run')) {
+    # 0 只表示「图画出来了」。验收不过时得给 CI 一个能拦住它的码，
+    # 否则 `Invoke-CadDraw.ps1 ... ; if ($LASTEXITCODE) {...}` 会当成功放行。
+    if ($result.disposition -eq 'fail') { exit 5 }
+    exit 0
+}
 elseif ($result.status -eq 'partial') { exit 3 }
+elseif ($result.status -eq 'blocked') { exit 4 }
 else { exit 1 }

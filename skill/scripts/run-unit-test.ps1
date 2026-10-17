@@ -29,6 +29,8 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'CadCommon.ps1')
 . (Join-Path $PSScriptRoot 'CadCompiler.ps1')
+. (Join-Path $PSScriptRoot 'CadEvidence.ps1')
+. (Join-Path $PSScriptRoot 'CadSpecCheck.ps1')
 
 $scriptRoot = $PSScriptRoot
 $work = [IO.Path]::GetFullPath($WorkDirectory)
@@ -665,6 +667,382 @@ Check 'DWG 小于下限判失败' ($d.valid -eq $false) "reason=$($d.reason)"
 
 $d = Test-CadDwgFile -Path (Join-Path $work 'nope.dwg')
 Check 'DWG 不存在判失败' ($d.valid -eq $false) "reason=$($d.reason)"
+
+# ══════════════════════════════════════════════════════════════════
+#  17. 证据分级与五态结论（CadEvidence.ps1）
+# ══════════════════════════════════════════════════════════════════
+
+Section '17. 证据分级与五态结论'
+
+$evKnown = New-CadEvidence -Kind 'spec' -Level 'known' -Message 'spec 声明 units=mm'
+$evScaled = New-CadEvidence -Kind 'dxf' -Level 'scaled' -Message 'DXF 声明 $INSUNITS=4'
+$evInferred = New-CadEvidence -Kind 'pixels' -Level 'inferred' -Message '按像素比对推测'
+$evUnread = New-CadEvidence -Kind 'text' -Level 'unreadable' -Message '文字不可读' -Value '[UNREADABLE]'
+
+Check 'New-CadEvidence 保留全部字段' ($evKnown.kind -eq 'spec' -and $evKnown.level -eq 'known' -and $evKnown.supports -eq $true) "supports=$($evKnown.supports)"
+Check 'New-CadEvidence 可记 value' ($evUnread.value -eq '[UNREADABLE]') "value=$($evUnread.value)"
+
+Check '最差证据：known 最低' ((Get-CadEvidenceWorst -Evidence @($evKnown)) -eq 'known') ''
+Check '最差证据：混入 scaled 后取 scaled' ((Get-CadEvidenceWorst -Evidence @($evKnown, $evScaled)) -eq 'scaled') ''
+Check '最差证据：inferred 压过 scaled' ((Get-CadEvidenceWorst -Evidence @($evKnown, $evScaled, $evInferred)) -eq 'inferred') ''
+Check '最差证据：unreadable 最重' ((Get-CadEvidenceWorst -Evidence @($evKnown, $evUnread)) -eq 'unreadable') ''
+Check '最差证据：空集返回 unreadable（无证据比可疑证据更糟）' ((Get-CadEvidenceWorst -Evidence @()) -eq 'unreadable') ''
+
+$onlyInferred = Get-CadEvidenceByLevel -Evidence @($evKnown, $evScaled, $evInferred) -Level 'inferred'
+Check '按级别筛选：inferred 命中 1 条' (@($onlyInferred).Count -eq 1) "count=$(@($onlyInferred).Count)"
+$onlyKnown = Get-CadEvidenceByLevel -Evidence @($evKnown, $evScaled) -Level 'known'
+Check '按级别筛选：known 命中 1 条' (@($onlyKnown).Count -eq 1) "count=$(@($onlyKnown).Count)"
+
+# 五态优先级
+$allOk = @([pscustomobject]@{ name = 'a'; pass = $true })
+$oneFail = @([pscustomobject]@{ name = 'a'; pass = $true }, [pscustomobject]@{ name = 'b'; pass = $false })
+Check '五态：全过 + 无证据 → pass' ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown)) -eq 'pass') ''
+Check '五态：有失败检查 → fail' ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown)) -eq 'fail') ''
+Check '五态：blocked 优先于 fail' ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown) -BlockedReason '单位缺失') -eq 'blocked') ''
+Check '五态：inferred 证据 → needs_review' ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown, $evInferred)) -eq 'needs_review') ''
+Check '五态：unreadable 证据 → needs_review' ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown, $evUnread)) -eq 'needs_review') ''
+Check '五态：有 warning → pass_with_warnings' ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown) -Warnings @('线型回落')) -eq 'pass_with_warnings') ''
+Check '五态：error + 有产物 → fail（不升级为 blocked）' ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown) -Error '炸了' -Artifacts @(@{ kind = 'dwg'; exists = $true })) -eq 'fail') ''
+
+$advPass = Get-CadDispositionAdvice -Disposition 'pass'
+$advBlocked = Get-CadDispositionAdvice -Disposition 'blocked'
+$advReview = Get-CadDispositionAdvice -Disposition 'needs_review'
+Check '五种 disposition 都有建议文案' ($advPass -and $advBlocked -and $advReview -and (Get-CadDispositionAdvice -Disposition 'fail') -and (Get-CadDispositionAdvice -Disposition 'pass_with_warnings')) ''
+Check 'blocked 建议点名 spec / errors' ($advBlocked -match 'spec|errors|实体都没画') "$advBlocked"
+Check 'needs_review 建议要求人工核对' ($advReview -match '核对|复核|看一眼|人工') "$advReview"
+
+# 哈希
+$h1 = Get-CadSha256 -Path (New-TestFile 'h1.txt' ([Text.Encoding]::UTF8.GetBytes('abc')))
+$h2 = Get-CadSha256 -Path (New-TestFile 'h2.txt' ([Text.Encoding]::UTF8.GetBytes('abc')))
+$h3 = Get-CadSha256 -Path (New-TestFile 'h3.txt' ([Text.Encoding]::UTF8.GetBytes('abd')))
+Check 'Get-CadSha256 稳定（同内容同哈希）' ($h1 -eq $h2) "$h1"
+Check 'Get-CadSha256 区分内容' ($h1 -ne $h3) "$h3"
+Check 'Get-CadSha256 是小写 64 位十六进制' ($h1 -match '^[0-9a-f]{64}$') "$h1"
+Check 'Get-CadSha256 不存在的文件返回 null' ($null -eq (Get-CadSha256 -Path (Join-Path $work 'nohash.txt'))) ''
+
+# ══════════════════════════════════════════════════════════════════
+#  18. 清单复现：manifest 生成与比对（CadEvidence.ps1）
+# ══════════════════════════════════════════════════════════════════
+
+Section '18. 清单复现：manifest 生成与比对'
+
+$specPath = Join-Path $work 'm-spec.json'
+[IO.File]::WriteAllText($specPath, '{"units":"mm","entities":[]}')
+$specSha = Get-CadSha256 -Path $specPath
+$artDwg = New-TestFile 'm.dwg' ([byte[]]([Text.Encoding]::ASCII.GetBytes('AC1032') + (New-Object byte[] 3000)))
+$artDxf = New-TestFile 'm.dxf' ([Text.Encoding]::UTF8.GetBytes("0`nSECTION`n2`nENTITIES`n0`nENDSEC`n0`nEOF`n"))
+
+$man = New-CadManifest -SpecFile $specPath -Spec @{ units = 'mm' } -DrawingName 'm' `
+    -Artifacts @([pscustomobject]@{ kind = 'dwg'; path = $artDwg }, [pscustomobject]@{ kind = 'dxf'; path = $artDxf }) `
+    -Evidence @($evKnown, $evScaled) -Disposition 'pass' `
+    -Units 'mm' -UnitsCode 4 -EntityCount 12 -Layers @('GEO', 'HOLE')
+Check 'manifest 记 schemaVersion=1' ($man.schemaVersion -eq 1) "got=$($man.schemaVersion)"
+Check 'manifest 记工具与版本' ($man.tool -eq 'cad-automatic-wwj' -and $man.toolVersion) "tool=$($man.tool) v=$($man.toolVersion)"
+Check 'manifest 记 spec 哈希' ($man.specSha256 -eq $specSha) "$($man.specSha256)"
+Check 'manifest 算 cadcore 哈希' ($man.cadCoreSha256 -match '^[0-9a-f]{64}$') "$($man.cadCoreSha256)"
+Check 'manifest 记单位' ($man.units.name -eq 'mm' -and $man.units.code -eq 4) "$($man.units.name)/$($man.units.code)"
+Check 'manifest 的 artifacts 带字节数与哈希' ($man.artifacts.Count -eq 2 -and $man.artifacts[0].bytes -gt 0 -and $man.artifacts[0].sha256 -match '^[0-9a-f]{64}$') "bytes=$($man.artifacts[0].bytes)"
+
+$manPath = Write-CadManifest -Manifest $man -Path (Join-Path $work 'manifest.json')
+Check 'Write-CadManifest 落盘成功' ($manPath -and (Test-Path -LiteralPath $manPath)) "$manPath"
+$manBack = Get-Content -LiteralPath $manPath -Raw -Encoding UTF8 | ConvertFrom-Json
+Check '落盘的 manifest 是 UTF-8 无 BOM（中文图层名不乱码）' (@($manBack.layers)[0] -eq 'GEO') "layers=$($manBack.layers -join ',')"
+Check '落盘的 manifest 保留 disposition 与 evidence' ($manBack.disposition -eq 'pass' -and $manBack.evidence.Count -eq 2) "disp=$($manBack.disposition) ev=$($manBack.evidence.Count)"
+
+# 自比对：同一份清单必须 identical
+$cmpSame = Compare-CadManifest -Before $man -After $man
+Check '自比对 → identical' ($cmpSame.identical -eq $true -and $cmpSame.diffCount -eq 0) "diffs=$($cmpSame.diffCount)"
+
+# 改 spec 哈希 → 必须检出
+$manChangedSpec = $man.PSObject.Copy()
+$manChangedSpec.specSha256 = ('0' * 64)
+$cmpSpec = Compare-CadManifest -Before $man -After $manChangedSpec
+Check '改 spec 哈希被检出' ($cmpSpec.identical -eq $false -and ($cmpSpec.diffs | Where-Object { $_.field -eq 'specSha256' })) "diffs=$($cmpSpec.diffCount)"
+
+# 改实体数 → 必须检出
+$manChangedCnt = $man.PSObject.Copy()
+$manChangedCnt.entityCount = 99
+$cmpCnt = Compare-CadManifest -Before $man -After $manChangedCnt
+Check '改实体数被检出' ($cmpCnt.identical -eq $false -and ($cmpCnt.diffs | Where-Object { $_.field -eq 'entityCount' })) "diffs=$($cmpCnt.diffCount)"
+
+# 改 cadcore 哈希 → 必须检出（cadcore 换了，复现性就断了）
+$manChangedCore = $man.PSObject.Copy()
+$manChangedCore.cadCoreSha256 = ('f' * 64)
+$cmpCore = Compare-CadManifest -Before $man -After $manChangedCore
+Check '改 cadcore 哈希被检出' ($cmpCore.identical -eq $false -and ($cmpCore.diffs | Where-Object { $_.field -eq 'cadCoreSha256' })) "diffs=$($cmpCore.diffCount)"
+
+# 改产物哈希 → 必须检出
+$manChangedArt = $man.PSObject.Copy()
+$manChangedArt.artifacts = @(
+    [pscustomobject]@{ kind = 'dwg'; path = $artDwg; exists = $true; bytes = $man.artifacts[0].bytes; sha256 = ('a' * 64) },
+    [pscustomobject]@{ kind = 'dxf'; path = $artDxf; exists = $true; bytes = $man.artifacts[1].bytes; sha256 = $man.artifacts[1].sha256 }
+)
+$cmpArt = Compare-CadManifest -Before $man -After $manChangedArt
+Check '改产物哈希被检出' ($cmpArt.identical -eq $false -and ($cmpArt.diffs | Where-Object { $_.field -like '*dwg*' })) "diffs=$($cmpArt.diffCount)"
+
+# timestamp / 路径 / disposition 变化不算差异（否则每次跑都 identical=false）
+$manOther = $man.PSObject.Copy()
+$manOther.timestamp = '1999-01-01T00:00:00Z'
+$manOther.disposition = 'pass_with_warnings'
+$cmpNoise = Compare-CadManifest -Before $man -After $manOther
+Check 'timestamp/disposition 变化不算差异（避免误报）' ($cmpNoise.identical -eq $true) "diffs=$($cmpNoise.diffCount)"
+
+# ══════════════════════════════════════════════════════════════════
+#  19. 单位校验与必需图层（CadEvidence.ps1）
+# ══════════════════════════════════════════════════════════════════
+
+Section '19. 单位校验与必需图层'
+
+# 造一张带 $INSUNITS 的 DXF
+$dxfUnits = Join-Path $work 'u.dxf'
+$uBody = @(
+    '0', 'SECTION', '2', 'HEADER'
+    '9', '$ACADVER', '1', 'AC1015'
+    '9', '$INSUNITS', '70', '     4'
+    '9', '$EXTMIN', '10', '0.0', '20', '0.0', '30', '0.0'
+    '9', '$EXTMAX', '10', '100.0', '20', '60.0', '30', '0.0'
+    '0', 'ENDSEC'
+    '0', 'SECTION', '2', 'ENTITIES'
+    '0', 'LINE', '8', 'GEO', '10', '0.0', '20', '0.0', '30', '0.0', '11', '10.0', '21', '0.0', '31', '0.0'
+    '0', 'CIRCLE', '8', 'HOLE', '10', '5.0', '20', '5.0', '30', '0.0', '40', '2.5'
+    '0', 'ENDSEC'
+    '0', 'EOF'
+) -join "`n"
+[IO.File]::WriteAllText($dxfUnits, $uBody, [Text.Encoding]::UTF8)
+
+$hv = Get-CadDxfHeaderVar -Path $dxfUnits -Name 'INSUNITS'
+Check 'Get-CadDxfHeaderVar 读 $INSUNITS' ($hv -match '4') "raw='$hv'"
+$hvNoDollar = Get-CadDxfHeaderVar -Path $dxfUnits -Name '$EXTMAX'
+Check 'Get-CadDxfHeaderVar 支持不带 $ 前缀' ($hvNoDollar -match '100') "raw='$hvNoDollar'"
+$hvMissing = Get-CadDxfHeaderVar -Path $dxfUnits -Name '$NOSUCHVAR'
+Check 'Get-CadDxfHeaderVar 读不到的变量返回空' ([string]::IsNullOrEmpty($hvMissing)) "raw='$hvMissing'"
+
+$du = Get-CadDrawingUnits -Path $dxfUnits
+Check 'Get-CadDrawingUnits 读出 mm/4' ($du.code -eq 4 -and $du.name -eq 'mm' -and $du.unitToMm -eq 1.0) "code=$($du.code) name=$($du.name) toMm=$($du.unitToMm)"
+Check 'Get-CadDrawingUnits 带证据级别' ($du.evidence.level -eq 'scaled') "level=$($du.evidence.level)"
+
+$ucMm = Test-CadUnits -Path $dxfUnits -Expected 'mm'
+Check '单位一致：mm = mm' ($ucMm.match -eq $true) "actual=$($ucMm.actual) expected=$($ucMm.expected)"
+$ucM = Test-CadUnits -Path $dxfUnits -Expected 'm'
+Check '单位不符：mm ≠ m' ($ucM.match -eq $false) "msg=$($ucM.evidence.message)"
+Check '单位不符时 message 算出倍数' ($ucM.evidence.message -match '0.001') "$($ucM.evidence.message)"
+$ucCN = Test-CadUnits -Path $dxfUnits -Expected '毫米'
+Check '中文单位名认得出（毫米 = mm）' ($ucCN.match -eq $true) "expectedCode=$($ucCN.expectedCode)"
+$ucBogus = Test-CadUnits -Path $dxfUnits -Expected 'furlong'
+Check '期望单位认不出 → 三值 null（needs_review，不是 fail）' ($null -eq $ucBogus.match) "expectedCode=$($ucBogus.expectedCode)"
+
+$dxfNoUnits = Join-Path $work 'nu.dxf'
+[IO.File]::WriteAllText($dxfNoUnits, (@(
+    '0', 'SECTION', '2', 'HEADER', '9', '$ACADVER', '1', 'AC1015', '0', 'ENDSEC',
+    '0', 'SECTION', '2', 'ENTITIES', '0', 'ENDSEC', '0', 'EOF'
+) -join "`n"), [Text.Encoding]::UTF8)
+$ucNone = Test-CadUnits -Path $dxfNoUnits -Expected 'mm'
+Check '图纸没声明单位 → 三值 null' ($null -eq $ucNone.match) "actual=$($ucNone.actual)"
+
+$dxfUnitless = Join-Path $work 'ul.dxf'
+[IO.File]::WriteAllText($dxfUnitless, (@(
+    '0', 'SECTION', '2', 'HEADER', '9', '$INSUNITS', '70', '     0', '0', 'ENDSEC',
+    '0', 'SECTION', '2', 'ENTITIES', '0', 'ENDSEC', '0', 'EOF'
+) -join "`n"), [Text.Encoding]::UTF8)
+$ucUnitless = Test-CadUnits -Path $dxfUnitless -Expected 'mm'
+Check '图纸是 unitless → 三值 null（不当成不符）' ($null -eq $ucUnitless.match) "actual=$($ucUnitless.actual)"
+
+$ents = @(Get-CadDxfEntities -Path $dxfUnits)
+Check 'Get-CadDxfEntities 读出 2 个实体' ($ents.Count -eq 2) "count=$($ents.Count)"
+
+$rlOk = Test-CadRequiredLayers -Required @('GEO', 'HOLE') -DxfPath $dxfUnits -Entities $ents
+Check '必需图层都存在且有实体 → pass' ($rlOk.pass -eq $true) "missing=$($rlOk.missing -join ',') empty=$($rlOk.empty -join ',')"
+$rlMiss = Test-CadRequiredLayers -Required @('GEO', 'NOPE') -DxfPath $dxfUnits -Entities $ents
+Check '必需图层缺失 → fail 且点名' ($rlMiss.pass -eq $false -and $rlMiss.missing -contains 'NOPE') "missing=$($rlMiss.missing -join ',')"
+$rlCase = Test-CadRequiredLayers -Required @('geo', 'hole') -DxfPath $dxfUnits -Entities $ents
+Check '图层名不区分大小写' ($rlCase.pass -eq $true) "present=$($rlCase.present -join ',')"
+
+# 空图层：声明了但没有任何实体
+$dxfEmptyLayer = Join-Path $work 'el.dxf'
+[IO.File]::WriteAllText($dxfEmptyLayer, (@(
+    '0', 'SECTION', '2', 'TABLES',
+    '0', 'LAYER', '2', 'GHOST', '70', '0', '62', '7', '6', 'CONTINUOUS',
+    '0', 'ENDTAB',
+    '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LINE', '8', 'GEO', '10', '0.0', '20', '0.0', '30', '0.0', '11', '1.0', '21', '0.0', '31', '0.0',
+    '0', 'ENDSEC', '0', 'EOF'
+) -join "`n"), [Text.Encoding]::UTF8)
+$entsEl = @(Get-CadDxfEntities -Path $dxfEmptyLayer)
+$rlEmpty = Test-CadRequiredLayers -Required @('GHOST') -DxfPath $dxfEmptyLayer -Entities $entsEl
+Check '空图层（有声明无实体）判 fail 并归入 empty' ($rlEmpty.pass -eq $false -and $rlEmpty.empty -contains 'GHOST') "missing=$($rlEmpty.missing -join ',') empty=$($rlEmpty.empty -join ',')"
+
+# 尺寸
+$ex = Get-CadExtentSize -Path $dxfUnits
+Check 'Get-CadExtentSize 从 $EXTMIN/$EXTMAX 读尺寸' ([Math]::Abs($ex.width - 100.0) -lt 0.001 -and [Math]::Abs($ex.height - 60.0) -lt 0.001) "w=$($ex.width) h=$($ex.height)"
+Check 'Get-CadExtentSize 换算成毫米' ([Math]::Abs($ex.widthMm - 100.0) -lt 0.001) "wMm=$($ex.widthMm)"
+
+# ══════════════════════════════════════════════════════════════════
+#  20. 出图前 spec 预检（CadSpecCheck.ps1）
+# ══════════════════════════════════════════════════════════════════
+
+Section '20. 出图前 spec 预检'
+
+$specOk = @{ units = 'mm'; entities = @(
+    @{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) },
+    @{ type = 'circle'; c = @(5, 5); r = 2.5 },
+    @{ type = 'rect'; p1 = @(0, 0); p2 = @(20, 10) }
+) }
+$rOk = Test-CadSpecStrict -Spec $specOk
+Check '合法 spec → ok' ($rOk.ok -eq $true) "errors=$(@($rOk.errors).Count) warnings=$(@($rOk.warnings).Count)"
+Check '合法 spec → 统计实体数与图层数' ($rOk.stats.entityCount -eq 3) "entities=$($rOk.stats.entityCount)"
+
+$specBadType = @{ entities = @(@{ type = 'blob' }) }
+$rBadType = Test-CadSpecStrict -Spec $specBadType
+Check '未知 type → 不通过' ($rBadType.ok -eq $false) ''
+Check '未知 type 的报错列出全部合法取值' (($rBadType.errors -join ' ') -match 'line' -and ($rBadType.errors -join ' ') -match 'erase' -and ($rBadType.errors -join ' ') -match 'boltpattern') "$($rBadType.errors -join ' | ')"
+
+$specMissField = @{ entities = @(@{ type = 'circle'; c = @(0, 0) }) }
+$rMiss = Test-CadSpecStrict -Spec $specMissField
+Check '缺必需字段 → 不通过且点名' ($rMiss.ok -eq $false -and ($rMiss.errors -join ' ') -match 'r 或 radius') "$($rMiss.errors -join ' | ')"
+
+$specFlatPoints = @{ entities = @(@{ type = 'polyline'; points = @(0, 0) }) }
+$rFlat = Test-CadSpecStrict -Spec $specFlatPoints
+Check '平铺点数组被抓住（点列表必须嵌套）' ($rFlat.ok -eq $false -and ($rFlat.errors -join ' ') -match '嵌套') "$($rFlat.errors -join ' | ')"
+
+$specOnePoint = @{ entities = @(@{ type = 'polyline'; points = @(@(0, 0)) }) }
+$rOne = Test-CadSpecStrict -Spec $specOnePoint
+# PowerShell 会把单元素嵌套数组 @(@(0,0)) 展平成 @(0,0)，保真路径也救不回来
+# （数组入参时已被展平）。所以这里实际报的是「平铺」而不是「至少需要 2 个点」。
+# 两条都是正确的拦截 —— 展平成 2 个数字后 polyline 同样凑不出 2 个点。
+# 断言按实际报错口径写，不为了好看硬改成不存在的文案。
+Check '只有 1 个点的 polyline 被抓住' ($rOne.ok -eq $false -and ($rOne.errors -join ' ') -match '嵌套|至少需要 2 个点') "$($rOne.errors -join ' | ')"
+
+$specZeroRect = @{ entities = @(@{ type = 'rect'; p1 = @(0, 0); p2 = @(0, 10) }) }
+$rZero = Test-CadSpecStrict -Spec $specZeroRect
+Check 'rect 宽为 0 被抓住' ($rZero.ok -eq $false -and ($rZero.errors -join ' ') -match '宽度为 0') "$($rZero.errors -join ' | ')"
+
+$specNegR = @{ entities = @(@{ type = 'circle'; c = @(0, 0); r = -5 }) }
+$rNeg = Test-CadSpecStrict -Spec $specNegR
+Check '负半径被抓住' ($rNeg.ok -eq $false -and ($rNeg.errors -join ' ') -match '必须大于 0') "$($rNeg.errors -join ' | ')"
+
+$specOverflow = @{ entities = @(@{ type = 'point'; at = @(5e7, 0) }) }
+$rOver = Test-CadSpecStrict -Spec $specOverflow
+Check '坐标溢出 ±1e7 被抓住' ($rOver.ok -eq $false -and ($rOver.errors -join ' ') -match '超出') "$($rOver.errors -join ' | ')"
+
+$specDupLayer = @{
+    layers = @(@{ name = 'GEO'; color = 7 }, @{ name = 'geo'; color = 3 })
+    entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) })
+}
+$rDupLayer = Test-CadSpecStrict -Spec $specDupLayer
+Check '重复图层（不区分大小写）被抓住' ($rDupLayer.ok -eq $false -and ($rDupLayer.errors -join ' ') -match '重复声明') "$($rDupLayer.errors -join ' | ')"
+
+$specUndeclared = @{ entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0); layer = 'NOPE' }) }
+$rUndeclared = Test-CadSpecStrict -Spec $specUndeclared
+Check '引用未声明图层 → warning（会自动补建）' ($rUndeclared.ok -eq $true -and ($rUndeclared.warnings -join ' ') -match 'NOPE') "warnings=$($rUndeclared.warnings -join ' | ')"
+
+$specNoUnits = @{ entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) }) }
+$rNoUnits = Test-CadSpecStrict -Spec $specNoUnits
+Check '缺 units → warning 但不阻塞' ($rNoUnits.ok -eq $true -and ($rNoUnits.warnings -join ' ') -match 'units') "warnings=$($rNoUnits.warnings -join ' | ')"
+
+$specBadUnits = @{ units = 'furlong'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) }) }
+$rBadUnits = Test-CadSpecStrict -Spec $specBadUnits
+Check '非法 units → warning 且不阻塞' ($rBadUnits.ok -eq $true -and ($rBadUnits.warnings -join ' ') -match 'furlong') "warnings=$($rBadUnits.warnings -join ' | ')"
+
+$specNoSave = @{ units = 'mm'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) }) }
+$rNoSave = Test-CadSpecStrict -Spec $specNoSave
+Check '无 save → warning（不出产物）' ($rNoSave.ok -eq $true -and ($rNoSave.warnings -join ' ') -match 'save') "warnings=$($rNoSave.warnings -join ' | ')"
+
+$specDupId = @{ entities = @(
+    @{ id = 'e1'; type = 'line'; p1 = @(0, 0); p2 = @(1, 0) },
+    @{ id = 'e1'; type = 'line'; p1 = @(0, 0); p2 = @(2, 0) }
+) }
+$rDupId = Test-CadSpecStrict -Spec $specDupId
+Check '重复实体 id 被抓住' ($rDupId.ok -eq $false -and ($rDupId.errors -join ' ') -match 'id') "$($rDupId.errors -join ' | ')"
+
+# 约束
+$specUnitsC = @{ units = 'mm'; constraints = @{ expectedUnits = 'm' }; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) }) }
+$rUnitsC = Test-CadSpecStrict -Spec $specUnitsC
+Check 'constraints.expectedUnits 不符 → 不通过' ($rUnitsC.ok -eq $false -and ($rUnitsC.errors -join ' ') -match 'expectedUnits') "$($rUnitsC.errors -join ' | ')"
+
+$specLayersC = @{ units = 'mm'; constraints = @{ requiredLayers = @('DIM') }; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) }) }
+$rLayersC = Test-CadSpecStrict -Spec $specLayersC
+Check 'constraints.requiredLayers 缺失 → 不通过' ($rLayersC.ok -eq $false -and ($rLayersC.errors -join ' ') -match 'DIM') "$($rLayersC.errors -join ' | ')"
+
+$specWidthC = @{ units = 'mm'; entities = @(@{ type = 'rect'; p1 = @(0, 0); p2 = @(150, 50) }); constraints = @{ maxWidth = 100 } }
+$rWidthC = Test-CadSpecStrict -Spec $specWidthC
+Check 'constraints.maxWidth 超限被抓住' ($rWidthC.ok -eq $false -and ($rWidthC.errors -join ' ') -match 'maxWidth') "$($rWidthC.errors -join ' | ')"
+
+$specGapC = @{ units = 'mm'; entities = @(
+    @{ type = 'circle'; c = @(0, 0); r = 10 },
+    @{ type = 'circle'; c = @(21, 0); r = 10 }
+); constraints = @{ minGap = 5 } }
+$rGapC = Test-CadSpecStrict -Spec $specGapC
+Check 'constraints.minGap 净距不足被抓住' ($rGapC.ok -eq $false -and ($rGapC.errors -join ' ') -match '净距') "$($rGapC.errors -join ' | ')"
+
+$specClosedC = @{ units = 'mm'; entities = @(
+    @{ type = 'polyline'; points = @(@(0, 0), @(10, 0), @(10, 10), @(0, 10)) }
+); constraints = @{ requireClosed = $true } }
+$rClosedC = Test-CadSpecStrict -Spec $specClosedC
+Check 'constraints.requireClosed 抓到未闭合 polyline' ($rClosedC.ok -eq $false -and ($rClosedC.errors -join ' ') -match '闭合') "$($rClosedC.errors -join ' | ')"
+
+$specMaxEntC = @{ units = 'mm'; entities = @(
+    @{ type = 'line'; p1 = @(0, 0); p2 = @(1, 0) },
+    @{ type = 'line'; p1 = @(0, 0); p2 = @(2, 0) }
+); constraints = @{ maxEntities = 1 } }
+$rMaxEntC = Test-CadSpecStrict -Spec $specMaxEntC
+Check 'constraints.maxEntities 超限被抓住' ($rMaxEntC.ok -eq $false -and ($rMaxEntC.errors -join ' ') -match 'maxEntities') "$($rMaxEntC.errors -join ' | ')"
+
+# 别名
+# circle 认 center/radius（编译器 CadCompiler.ps1 有回落），line 只认 p1/p2。
+# line 用 start/end 是用户误写 —— 预检查出来并点名 p1/p2 才是对的，
+# 不能为了让这条断言通过就给 line 也加别名（那会让两种写法并存，
+# 出错时用户不知道该按哪个改）。
+$specAlias = @{ units = 'mm'; entities = @(
+    @{ type = 'circle'; center = @(0, 0); radius = 5 }
+) }
+$rAlias = Test-CadSpecStrict -Spec $specAlias
+Check 'circle 别名按等价处理（center/radius）' ($rAlias.ok -eq $true) "errors=$($rAlias.errors -join ' | ')"
+Check '别名用法记 warning 提示规范写法' (($rAlias.warnings -join ' ') -match 'radius|规范|p1') "$($rAlias.warnings -join ' | ')"
+
+$specLineAlias = @{ units = 'mm'; entities = @(
+    @{ type = 'line'; start = @(0, 0); end = @(1, 1) }
+) }
+$rLineAlias = Test-CadSpecStrict -Spec $specLineAlias
+Check 'line 的 start/end 被抓到并点名 p1/p2' ($rLineAlias.ok -eq $false -and ($rLineAlias.errors -join ' ') -match 'p1|p2') "$($rLineAlias.errors -join ' | ')"
+
+# 空 entities
+$specEmpty = @{ units = 'mm'; entities = @() }
+$rEmpty = Test-CadSpecStrict -Spec $specEmpty
+Check 'entities 为空 → 不通过' ($rEmpty.ok -eq $false) "$($rEmpty.errors -join ' | ')"
+
+# 四份官方示例必须全过（防回归）
+foreach ($sn in @('01-simple-plate.json', '02-flange-plate.json', '03-gears.json', '04-all-entities.json')) {
+    $sp = Join-Path $scriptRoot "..\assets\samples\$sn"
+    if (Test-Path -LiteralPath $sp) {
+        $sj = Get-Content -LiteralPath $sp -Raw -Encoding UTF8 | ConvertFrom-Json
+        $rs = Test-CadSpecStrict -Spec $sj
+        Check "官方示例 $sn 预检通过" ($rs.ok -eq $true) "errors=$(@($rs.errors).Count) warnings=$(@($rs.warnings).Count)"
+    } else {
+        Check "官方示例 $sn 预检通过" $false "文件不存在: $sp"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  21. 编译器接入 units（cadcore 生成 cadunits 调用）
+# ══════════════════════════════════════════════════════════════════
+
+Section '21. 编译器接入 units'
+
+$uSpecMm = @{ units = 'mm'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }); save = @{ dwg = 't.dwg' } }
+$cu = Compile-CadSpec -Spec $uSpecMm -CoreLspPath 'D:\deepseek harness gongzuoqu\cad-automatic-wwj\skill\scripts\cadcore.lsp'
+Check 'units=mm 生成 (cadunits 4)' ($cu.lisp -match '\(cadunits 4\)') "$(($cu.lisp -split "`n" | Where-Object { $_ -match 'cadunits' }) -join ' | ')"
+
+$uSpecM = @{ units = 'm'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }) }
+$cuM = Compile-CadSpec -Spec $uSpecM -CoreLspPath 'D:\deepseek harness gongzuoqu\cad-automatic-wwj\skill\scripts\cadcore.lsp'
+Check 'units=m 生成 (cadunits 6)' ($cuM.lisp -match '\(cadunits 6\)') ''
+
+$uSpecNone = @{ entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }) }
+$cuNone = Compile-CadSpec -Spec $uSpecNone -CoreLspPath 'D:\deepseek harness gongzuoqu\cad-automatic-wwj\skill\scripts\cadcore.lsp'
+Check '缺 units → 不生成 cadunits 但有 warning' ($cuNone.lisp -notmatch '\(cadunits ' -and ($cuNone.warnings -join ' ') -match 'units') "warnings=$($cuNone.warnings -join ' | ')"
+
+$uSpecBogus = @{ units = 'furlong'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }) }
+$cuBogus = Compile-CadSpec -Spec $uSpecBogus -CoreLspPath 'D:\deepseek harness gongzuoqu\cad-automatic-wwj\skill\scripts\cadcore.lsp'
+Check '非法 units → 不生成 cadunits 且有 warning' ($cuBogus.lisp -notmatch '\(cadunits ' -and ($cuBogus.warnings -join ' ') -match 'furlong') "warnings=$($cuBogus.warnings -join ' | ')"
 
 # ══════════════════════════════════════════════════════════════════
 #  汇总

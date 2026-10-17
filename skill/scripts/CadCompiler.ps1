@@ -493,6 +493,29 @@ function Compile-CadSpec {
     [void]$sb.AppendLine("(load `"$core`")")
     [void]$sb.AppendLine('(if (not (c:SETUP)) (princ "\n@@SETUP_FAILED@@"))')
 
+    # ── 单位（INSUNITS）──
+    # 这是整张图最容易被忽略、又最贵的一个属性。
+    # 不设 INSUNITS 的图纸，插进别人的图里会被当成「无单位」按 1:1 硬塞，
+    # 于是 φ80 的法兰在总装里变成 φ80 英寸 ≈ 2 米 —— 图上每个尺寸标注都对，
+    # 装配出来是废品。所以 units 必须真的写进图纸头，而不是只留在 JSON 里。
+    #
+    # units 缺失时不动 INSUNITS（保持种子模板的原值），但记 warning：
+    # 悄悄替用户选一个单位，比不选更危险。
+    $unitName = Get-CadField $Spec 'units'
+    if ($unitName) {
+        $unitCode = -1
+        if (Get-Command Get-CadUnitCode -ErrorAction SilentlyContinue) {
+            $unitCode = Get-CadUnitCode -Name ([string]$unitName)
+        }
+        if ($unitCode -ge 0) {
+            [void]$sb.AppendLine("(cadunits $unitCode)")
+        } else {
+            $warnings.Add("units='$unitName' 不是可识别的单位名（可用 mm/cm/m/in/ft/mil/yd/mi/km/unitless），已保持图纸原设置")
+        }
+    } else {
+        $warnings.Add('未声明 units，图纸将沿用模板的 INSUNITS；下游工具可能按无单位处理，建议在 spec 顶层写明')
+    }
+
     # ── 图层 ──
     # LISP 没有可选参数：c:LAYER 声明了 (name color ltype)，少传一个就是
     # 「参数太少」运行时错误，所以这里永远补齐三个实参。

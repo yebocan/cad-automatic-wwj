@@ -576,6 +576,13 @@ function Read-CadDxfPairs {
         $text = $script:CadScrEncoding.GetString($bytes)
         $usedEncoding = 'gbk'
     }
+    # ★ 剥 BOM ★
+    # 外部 DXF（用户从 AutoCAD 手工导出的）很可能带 UTF-8 BOM。
+    # 不剥的话第一行组码变成 "\uFEFF0"，Trim() 去不掉 BOM，
+    # int::TryParse 失败 → 记 malformed 且 i+=2 跳两行，
+    # (0,SECTION) 连同它的值一起被吃掉 → 整个 TABLES 段读不到，
+    # 图层声明、线型表全部丢失，而报错只出现在第 1 行、看不出因果。
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
     $lines = $text -split "\r?\n"
 
     $pairs = New-Object System.Collections.Generic.List[object]
@@ -722,6 +729,52 @@ function Test-CadDxfFile {
     return [pscustomobject]$r
 }
 
+function Get-CadDxfLayerNames {
+    <#
+      从 ASCII DXF 的 TABLES 段读出所有 LAYER 声明的名字。
+      只读声明，不读实体 —— 用途是区分
+        "图层根本不存在"（required-layers 校验里的 missing）
+        与 "图层声明了但图纸上一个实体都没有"（empty）。
+      Get-CadDxfEntities 只扫 ENTITIES 段，拿不到 TABLES，所以
+      「图层 GHOST 存在但空」会被误判成 missing。本函数补上这一半。
+
+      匿名块（名字以 * 开头）不是图层，不会出现在 LAYER 表里。
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $doc = Read-CadDxfPairs -Path $Path
+    # ★ 不能写 @($doc.pairs) ★
+    # PS7.6.7 里对 List[object] 用 @() 会抛 "Argument types do not match"
+    # （见 CadPdf.ps1 的同款坑）。必须 .ToArray() 或直接当数组用。
+    $pairs = $doc.pairs
+    $out = New-Object System.Collections.Generic.List[string]
+    $inTables = $false
+
+    for ($i = 0; $i -lt $pairs.Count; $i++) {
+        $p = $pairs[$i]
+        if ($p.code -eq 0 -and $p.value -eq 'SECTION') {
+            $name = ''
+            if ($i + 1 -lt $pairs.Count -and $pairs[$i+1].code -eq 2) { $name = $pairs[$i+1].value }
+            $inTables = ($name -eq 'TABLES')
+            continue
+        }
+        if ($p.code -eq 0 -and $p.value -eq 'ENDSEC') { $inTables = $false; continue }
+        if (-not $inTables) { continue }
+
+        if ($p.code -eq 0 -and $p.value -eq 'LAYER') {
+            # DXF 的 LAYER 表项：0=LAYER 后紧跟 2=<层名>
+            if ($i + 1 -lt $pairs.Count -and $pairs[$i+1].code -eq 2) {
+                $ly = [string]$pairs[$i+1].value
+                if ($ly -and -not $out.Contains($ly)) { $out.Add($ly) | Out-Null }
+            }
+        }
+    }
+
+    return $out.ToArray()
+}
+
 function Get-CadDxfEntities {
     <#
       从 ASCII DXF 的 ENTITIES 段读出实体清单。
@@ -839,6 +892,80 @@ function Get-CadDxfBlockNames {
     return $out.ToArray()
 }
 
+# ══════════════════════════════════════════════════════════════════
+#  单位（INSUNITS）
+# ══════════════════════════════════════════════════════════════════
+#  这张表放在公共库里而不是证据模块里，原因是两个模块都要用它：
+#    · CadCompiler.ps1 出图时要生成 (cadunits N)，把单位真写进图纸头
+#    · CadEvidence.ps1 体检时要读 $INSUNITS 反推物理尺寸
+#  编译器不该为了查一张表去依赖整个证据模块。
+#
+#  0 = unitless 是「明确声明无单位」，不是「未知」。我们在任何地方都照实
+#  报 0，不替用户猜成毫米 —— 猜错一次的代价是整批零件报废。
+
+$script:CadUnitTable = [ordered]@{
+    0  = 'unitless'
+    1  = 'in'
+    2  = 'ft'
+    3  = 'mi'
+    4  = 'mm'
+    5  = 'cm'
+    6  = 'm'
+    7  = 'km'
+    8  = 'microinch'
+    9  = 'mil'
+    10 = 'yd'
+}
+
+# 单位名 → 毫米的换算因子（scaled 级证据要用它算出真实尺寸）。
+# unitless 是 $null：没有物理量纲，任何换算都是编的。
+$script:CadUnitToMm = @{
+    'unitless'  = $null
+    'in'        = 25.4
+    'ft'        = 304.8
+    'mi'        = 1609344.0
+    'mm'        = 1.0
+    'cm'        = 10.0
+    'm'         = 1000.0
+    'km'        = 1000000.0
+    'microinch' = 0.0000254
+    'mil'       = 0.0254
+    'yd'        = 914.4
+}
+
+function Get-CadUnitName {
+    param([Parameter(Mandatory)][int]$Code)
+    if ($script:CadUnitTable.Contains($Code)) { return $script:CadUnitTable[$Code] }
+    return "unknown($Code)"
+}
+
+function Get-CadUnitCode {
+    <#
+      单位名 → INSUNITS 代码。接受常见别名（含中文），避免用户写
+      "millimeter" 或「毫米」就报错。
+      认不出来返回 -1 —— 调用方据此报 blocked，而不是默默按毫米处理。
+    #>
+    param([string]$Name)
+
+    if (-not $Name) { return -1 }
+    $s = $Name.Trim().ToLowerInvariant()
+
+    $aliases = @{
+        'none' = 0; 'unitless' = 0; '无单位' = 0
+        'in' = 1; 'inch' = 1; 'inches' = 1; '英寸' = 1
+        'ft' = 2; 'feet' = 2; 'foot' = 2; '英尺' = 2
+        'mi' = 3; 'mile' = 3; 'miles' = 3; '英里' = 3
+        'mm' = 4; 'millimeter' = 4; 'millimetre' = 4; 'millimeters' = 4; '毫米' = 4; '公厘' = 4
+        'cm' = 5; 'centimeter' = 5; 'centimetre' = 5; 'centimeters' = 5; '厘米' = 5
+        'm' = 6; 'meter' = 6; 'metre' = 6; 'meters' = 6; '米' = 6
+        'km' = 7; 'kilometer' = 7; 'kilometre' = 7; '千米' = 7; '公里' = 7
+        'microinch' = 8; 'microinches' = 8; '微英寸' = 8
+        'mil' = 9; 'mils' = 9; '密尔' = 9
+        'yd' = 10; 'yard' = 10; 'yards' = 10; '码' = 10
+    }
+    if ($aliases.ContainsKey($s)) { return $aliases[$s] }
+    return -1
+}
 # ══════════════════════════════════════════════════════════════════
 #  进程登记表 + 三道闸清理
 #

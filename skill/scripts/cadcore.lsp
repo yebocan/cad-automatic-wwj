@@ -59,11 +59,80 @@
 ;; 点 → "x,y,z" 字符串
 (defun cadpt (p) (strcat (cadnum (car p)) "," (cadnum (cadr p)) "," (cadnum (caddr p))))
 
+;; 列表 → 用分隔符串起来（AutoLISP 没有内置 join）
+(defun cadjoin (lst sep / s)
+  (setq s "")
+  (foreach x lst (if (= s "") (setq s x) (setq s (strcat s sep x))))
+  s
+)
+
 ;; 安全执行一个 command，吞掉返回的 nil
 (defun cadcmd (lst / r)
   (setvar "CMDECHO" 0)
   (setq r (apply 'command lst))
   (princ)
+)
+
+;; ── 单位 / 空间统计 ───────────────────────────────────────────────
+;;
+;; ★ 关于图纸空间：accoreconsole **没有布局引擎** ★
+;;
+;; 实测（AutoCAD 2018 accoreconsole）以下全部不可用：
+;;   (layoutlist)                      → no function definition: LAYOUTLIST
+;;   (vlax-get-acad-object)            → nil（vl-load-com 也不行）
+;;   (member '-LAYOUT (atoms-family 0)) → nil（命令不存在）
+;;   (setvar "CTAB" "Layout1")         → AutoCAD 变量设置被拒绝
+;;   (tblnext "LAYOUT")                → nil
+;;   (tblsearch "LAYOUT" "Layout1")    → 表函数参数无效
+;;   (ssget "_X" '((410 . "Model")))   → nil（410 组码不可过滤）
+;;
+;; 所以这个 skill **只画模型空间**，布局/图纸空间请走 Invoke-CadCom.ps1。
+;; 但 (67 . 0) / (67 . 1) 过滤器是可用的，用它区分模型/图纸空间实体。
+(defun cadspacecount ( / ss)
+  (setq ss (ssget "_X" '((67 . 0))))
+  (if ss (sslength ss) 0)
+)
+
+;; 图纸空间实体数（正常情况下恒 0，除非打开已有图纸）
+(defun cadpapercount ( / ss)
+  (setq ss (ssget "_X" '((67 . 1))))
+  (if ss (sslength ss) 0)
+)
+
+;; 设置单位：(c:UNITS 4) → 毫米
+;;   INSUNITS 取值：0 无单位 / 1 英寸 / 2 英尺 / 3 英里 / 4 毫米 / 5 厘米
+;;                  6 米 / 7 千米 / 8 微英寸 / 9 密耳 / 10 码
+;; **必须判 nil**：实测 (setvar "INSUNITS" nil) 直接抛
+;; 「AutoCAD 变量设置被拒绝: "INSUNITS" nil」，整个脚本停在这一行。
+(defun cadunits (u / cur)
+  (setq cur (getvar "INSUNITS"))
+  (cond
+    ((null u) (cadsay "UNITS" (strcat "ok=" (itoa cur) " (unchanged)")))
+    ((and (numberp u) (>= u 0) (<= u 10))
+     (setvar "INSUNITS" u)
+     (cadsay "UNITS" (strcat "ok=" (itoa (getvar "INSUNITS")) " was=" (itoa cur)))
+    )
+    (T (cadsay "UNITS" (strcat "FAILED=invalid:" (vl-princ-to-string u) " keep=" (itoa cur))))
+  )
+  (princ)
+)
+
+;; 单位名 → INSUNITS 码（供 PowerShell 侧对齐，LISP 侧也能查）
+(defun cadunitcode (name / s)
+  (setq s (strcase (if (= (type name) 'STR) name "")))
+  (cond
+    ((= s "NONE") 0) ((= s "UNITLESS") 0)
+    ((= s "IN") 1) ((= s "INCH") 1) ((= s "INCHES") 1)
+    ((= s "FT") 2) ((= s "FEET") 2)
+    ((= s "MI") 3) ((= s "MILE") 3) ((= s "MILES") 3)
+    ((= s "MM") 4) ((= s "MILLIMETER") 4) ((= s "MILLIMETERS") 4)
+    ((= s "CM") 5) ((= s "CENTIMETER") 5)
+    ((= s "M") 6) ((= s "METER") 6) ((= s "METERS") 6)
+    ((= s "KM") 7) ((= s "KILOMETER") 7)
+    ((= s "MIL") 9) ((= s "MILS") 9)
+    ((= s "YD") 10) ((= s "YARD") 10)
+    (T nil)
+  )
 )
 
 ;; ── 块构建器 ──────────────────────────────────────────────────────

@@ -18,7 +18,12 @@ AI 帮你画图时最常见的困境是「代码写出来了，但图纸在哪�
 | 校验 | **不信 LISP 自述**，独立校验产物字节 | DWG 头是 `AC10xx` 且 >2KB、DXF 能解析出 ENTITIES、PDF 含 `%PDF-`/`%%EOF`/`/Type/Page` |
 | 交叉复核 | 让另一个脚本把刚生成的图**读回来** | 实体类型统计、图层清单、中文文字是否完整 |
 | 体检 | 解析 DXF（DWG 先转 DXF）拿到结构事实 | 实体数、类型分布、图层、范围、块数、DXF 版本 |
+| 单位与必需图层 | 读 `$INSUNITS` 与 TABLES 里的图层声明 | 毫米换算、图层三分类（有实体/声明但空/根本没建） |
 | 导出 | 转 DXF（R12–2018）/ 打印 PDF | 实际生效的版本号（`AC1009`…`AC1032`）与请求值比对 |
+| PDF 反读 | 解析 PDF 内容流，把矢量路径写回 DXF | 路径数、坐标范围落在 MediaBox 内、DXF 结构 |
+| 图片预检 | 逐像素算墨迹与对比度 | 墨迹占比、包围盒、`darkIsInk` 自动判断 |
+| 结论分级 | 每条证据标 `known`/`scaled`/`inferred`/`unreadable` | 五态结论 `blocked`/`fail`/`needs_review`/`pass_with_warnings`/`pass` |
+| 复现比对 | 出 manifest，比 spec 与 cadcore 的哈希 | 同一份 spec 是否复现出同一张图 |
 | 修复 | 按 14 条规则逐项体检并处理 | 每条规则给出 `{id, title, status, action, detail}` |
 
 ## 2. 支持的环境
@@ -36,7 +41,7 @@ AI 帮你画图时最常见的困境是「代码写出来了，但图纸在哪�
 
 ## 3. 安装要求
 
-- 磁盘：技能本体约 260 KB（13 个 PowerShell 脚本 + 1 个 LISP + 5 篇参考文档 + 4 份示例）。
+- 磁盘：技能本体约 460 KB（14 个 PowerShell 脚本 + 1 个 LISP + 5 篇参考文档 + 4 份示例）。
 - 权限：普通用户即可。安装脚本只往当前用户的技能目录写文件，**不改系统环境变量、不改注册表、不动 PATH**。
 - 网络：不需要。安装与运行全程离线。
 
@@ -85,7 +90,7 @@ pwsh -File .\Install-Skill.ps1 -Action uninstall -Target dsh   # 只删本技能
 & "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts\run-test.ps1" -Test all
 ```
 
-看到 `集成自检  ·  47 / 47 通过，0 失败` 才算装好。**技能出现在列表里、AutoCAD 窗口弹出来了，都不能算装好。**
+看到 `集成自检  ·  65 / 65 通过，0 失败` 才算装好。**技能出现在列表里、AutoCAD 窗口弹出来了，都不能算装好。**
 
 ## 5. 如何定位 accoreconsole
 
@@ -272,6 +277,75 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 `Invoke-CadPlot` 报告里有 `pages` / `valid` / `orientation` / `plotArea` 回显，PDF 走 `Test-CadPdfFile` 三重校验（头 `%PDF-`、尾 `%%EOF`、≥1 个 `/Type/Page`）。
 
+### 8.1 出图前先预检
+
+```powershell
+& "$s\Test-CadSpec.ps1" -SpecFile .\demo.json -AsJson
+```
+
+不启动 AutoCAD，纯本地校验。用来在花 4 秒跑图之前先发现「注定失败」的 spec：负半径、`rect` 宽或高为 0（RECTANG 会退化成一条线）、坐标绝对值超 ±10⁷（多半是单位或小数点写错）、`polyline` 只有 1 个点、点是平铺数字数组、未知 `type`、重复 `id`、重复图层、`constraints` 冲突。
+
+**合法的 warning 不挡路**：未声明图层（编译器会自动补建）、缺 `units`、非法 `units`、`dxfVersion` 非法值都只记 warning 并给出回落值。
+
+### 8.2 结论分级与证据链
+
+每条结论都要说清自己是「量到的」还是「猜的」：
+
+| 级 | 含义 | 例子 |
+|---|---|---|
+| `known` | 直接读到的硬事实 | DXF 里 `$INSUNITS=4`、DWG 头是 `AC1032`、实体数 13 |
+| `scaled` | 读到锚点后换算出来的 | 按 INSUNITS=4 把 100 换算成 100mm |
+| `inferred` | 有依据但没直读到 | 图层里有 HATCH 就推断有填充区 |
+| `unreadable` | 想读但读不到 | 文件打不开、变量不存在、段被截断 |
+
+五态结论（`Get-CadDisposition`，取命中的最高档）：
+
+| 结论 | 触发条件 |
+|---|---|
+| `blocked` | 有 `BlockedReason` |
+| `fail` | 有 error |
+| `needs_review` | 只有 `unreadable` / `inferred` 级证据 |
+| `pass_with_warnings` | 有 warning |
+| `pass` | 全部 `known` 级 |
+
+⚠️ **产物存在与否不改变结论档位** —— `error` + 有半成品仍然只是 `fail`，不会升级成 `blocked`。产物在不在只影响调用方能不能救回半成品。
+
+**清单复现**（`New-CadManifest` / `Write-CadManifest` / `Compare-CadManifest`）回答「这两次跑出来的是不是同一张图」。只比 `specSha256`、`cadCoreSha256`、`units.code`、`entityCount`、`artifacts[].sha256`；**不比** `timestamp`、路径、`disposition`。两个哈希是 `New-CadManifest` 自己现算的，读不到就给 `$null` 让比对判差异 —— **绝不填假哈希**（假哈希会让 `identical=true` 变成谎言）。
+
+单位校验三个函数别混用：`Get-CadUnitCode -Name`（`mm`/`毫米` → 4，认不出返 -1，`unitless` → 0）、`Get-CadDrawingUnits -Path`（一张 DXF，返 `units` `unitToMm`）、`Test-CadUnits -Path -Expected`（返 `match` 三值，`$null` = 不知道）。
+
+`Test-CadRequiredLayers` 把结果分成三类，**三者对调用方是不同的诊断**：`present`（有声明也有实体）/ `empty`（有声明但模型空间没实体：建了层却漏画）/ `missing`（连声明都没有）。
+
+### 8.3 PDF 矢量路径 → DXF
+
+```powershell
+& "$s\Convert-CadPdfToDxf.ps1" -Path .\plan.pdf -Output .\plan.dxf -Scale 0.352778 -AsJson
+```
+
+纯本地解析，不启动任何进程，**没有 `-TimeoutSeconds`**。支持 `m/l/c/v/y/re/h` 路径算子、`S/s/f/F/f*/B/B*/b/b*/n` 上色算子、`q/Q/cm/w` 图形状态，FlateDecode 与 AsciiHex 过滤器。产物是 R12（AC1009）DXF：两点出 `LINE`，多点亮式 `POLYLINE`（`66=1` + VERTEX + SEQEND）。
+
+三条实现铁律（源码里有注释）：
+
+1. **`switch` 必须加 `-CaseSensitive`**。不加的话 `'q'` 分支压栈、`'Q'` 分支又弹栈，`cm` 变换被静默清掉 —— 症状是坐标原样透传、缩放丢失、位置偏移，**没有任何报错**。
+2. **CTM 快照要连 `lineWidth` 一起存**。
+3. **`Get-CadPdfStreams` 在没找到流时返回 `$null`**，取 `.Count` 会抛异常而报错位置指向 `return` 行。一律先 `@(...)` 包一层。
+
+位图 PDF（只含 DCTDecode XObject）会明确报「没找到可解析的矢量内容流，这多半是扫描件，需要先 OCR/矢量化」，exit 1 —— **不猜、不画一个空图交差**。
+
+**「范围落在 MediaBox 内」是 CTM 哨兵**：丢了 `cm` 矩阵时坐标会原样透传，典型症状是坐标跑到 372–6369 而 MediaBox 只有 842 宽。
+
+### 8.4 图片预检
+
+```powershell
+& "$s\Get-CadImageInfo.ps1" -Path .\photo.png -AsJson
+```
+
+四个函数分工（都在 `CadImage.ps1`）：`Get-CadImageInfo`（这是什么图）、`Get-CadImageInk`（有多少墨、偏在哪）、`Test-CadImageUsable`（能不能照抄，返 `ok`/`issues[]`/`advice`）、`Get-CadImageAscii`（让纯文本模型也「看」到形状）。
+
+`darkIsInk` 自动判断：平均亮度 < 110 时按「亮的是墨」处理 —— 否则 AutoCAD 黑底截图会被算成满墨，包围盒直接等于整张图。
+
+⚠️ **逐像素循环里绝不调 `Get-CadImageLuma`**：实测 400×260（10 万像素）从 130ms 涨到 2700ms，慢 20 倍。
+
 ## 9. 如何自动修复
 
 ```powershell
@@ -321,13 +395,18 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 | 中文变 `澶氳鏂囧瓧` | DXF 被当 GBK 读了 | 已修（严格 UTF-8 优先）；若手改过 `Read-CadDxfPairs` 要改回来 |
 | 打印出来的 PDF 是空的 | 打印范围选错 / 图层全关 | 用 `-PlotArea Extents`，检查图层是否可见 |
 | `未知命令 "N"` | `_N` 兜底数量加多了，被上一条命令消费掉了 | 只在确定已退出命令状态的位置加 |
+| PDF 转出的 DXF 坐标跑到几千几万 | `switch` 没加 `-CaseSensitive`，`cm` 变换被 `Q` 分支静默清掉 | 改成 `switch -CaseSensitive ($op)` |
+| 「在此对象上找不到属性 Count」，报错指向 `return` 行 | `Get-CadPdfStreams` 零流返 `$null`，取 `.Count` 抛异常 | `@(Get-CadPdfStreams -Bytes $bytes)` 包一层 |
+| DXF 解析出 0 对、`(0,SECTION)` 被吃 | 文件带 UTF-8 BOM，`Trim()` 剥不掉 `\uFEFF` | `Read-CadDxfPairs` 已加首字符 BOM 剥离 |
+| 图纸尺寸读出来是 `(0,0)` | `Get-CadExtentSize` 的 while 只判 code 9，跨段界读进实体坐标 | 停止条件补 `-and $pairs[$j].code -ne 0` |
 
 完整诊断树见 [skill/references/troubleshooting.md](skill/references/troubleshooting.md)。
 
 ## 12. 已知限制
 
 - **只测过 AutoCAD 2018**。2013–2025 的接口理论上一致（都是 `accoreconsole` + LISP），但没有逐一验证。低版本可能不认较新的 DXF 版本号。
-- **COM 通道不适用于无界面机器**：`acad.exe` 要真的起得来。`Invoke-CadCom.ps1` 有 `-Visible` 但默认不可见，起一次约 25 秒。
+- **COM 通道不适用于无界面机器**：`acad.exe` 要真的起得来。`Invoke-CadCom.ps1` 有 `-Visible` 但默认不可见，起一次约 25 秒。且 PowerShell 的 COM 编组不支持 `VT_ARRAY|VT_DISPATCH`，`CopyObjects` 跑不通（复制实体请走 `COPYCLIP`/`WBLOCK` 或选择集重建）。
+- **accoreconsole 没有布局引擎**：`layoutlist` / `-LAYOUT` / `setvar "CTAB"` / `tblnext "LAYOUT"` / 410 组码全不可用，要操作图纸空间只能走 COM 通道打开 `acad.exe`。
 - **DXF 版本控制走 `SAVEAS`**：`DXFOUT` 的第二个参数是精度不是版本（实测传 `"12"/"13"/"16"` 全出 `AC1032`）。
 - **不支持天正/中望等第三方对象**：只有 AutoCAD 原生实体能保证被解析。
 - **不做批量/多图并行**：一次一个 `accoreconsole` 实例，并发要调用方自己排。
@@ -346,21 +425,29 @@ $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 $s = "$env:USERPROFILE\.dsh\skills\cad-automatic-wwj\scripts"
 
 # 1) 单元测试（秒级，不需要 AutoCAD）
-pwsh -File "$s\run-unit-test.ps1"                       # 149 项
+pwsh -File "$s\run-unit-test.ps1"                       # 240 项
 
-# 2) 集成自检（真出图，约 15 秒）
-pwsh -File "$s\run-test.ps1" -Test all                  # 47 项
+# 2) 集成自检（真出图，约 20 秒）
+pwsh -File "$s\run-test.ps1" -Test all                  # 65 项
 
 # 3) 场景测试（三档）
-pwsh -File "$s\run-scenario-test.ps1" -Mode offline     # 9 个，纯编译校验
+pwsh -File "$s\run-scenario-test.ps1" -Mode offline     # 14 个，纯编译校验
 pwsh -File "$s\run-scenario-test.ps1" -Mode mock        # 11 个，坏路径注入
 pwsh -File "$s\run-scenario-test.ps1" -Mode real        # 3 个，真机
 pwsh -File "$s\run-scenario-test.ps1" -ListScenarios     # 看全部场景
 ```
 
-当前状态：**149 / 149**、**47 / 47**、**9 / 9**、**11 / 11**、**3 / 3**，全绿。
+当前状态：**240 / 240**、**65 / 65**、**14 / 14**、**11 / 11**、**3 / 3**，全绿。
 
-`-Mode mock` 用一个假的 `accoreconsole` 注入坏路径（无产物、无 `@@DONE@@`、LISP 报错、图找不到、坏 DXF、坏 PDF、弹对话框、卡死），证明**判定逻辑本身**是有效的 —— 它证明不了真机行为。`-Mode real` 才是真机。
+三档模式回答三个不同的问题：
+
+| 模式 | 数量 | 证明什么 | **不能**证明什么 |
+|---|---|---|---|
+| `mock` | 11 | 脚本对 accoreconsole 输出的**解析与判定**是对的 | 真机行为 |
+| `offline` | 14 | 编译与预检逻辑、编码、PDF/DXF 解析、清单比对 | 任何真机交互 |
+| `real` | 3 | 真 accoreconsole 全链路 | 别的机器/别的 AutoCAD 版本 |
+
+`-Mode mock` 用一个假的 `accoreconsole` 注入坏路径（无产物、无 `@@DONE@@`、LISP 报错、图找不到、坏 DXF、坏 PDF、弹对话框、卡死），证明**判定逻辑本身**是有效的。
 
 ## 目录结构
 
@@ -380,13 +467,17 @@ cad-automatic-wwj/
    │  └─ fixtures/                故意做坏的样张
    ├─ references/
    │  ├─ spec.md                  JSON schema 全字段说明
-   │  ├─ commands.md              cadcore.lsp 的 51 个函数
+   │  ├─ commands.md              cadcore.lsp 的 55 个函数 + 11 个 CLI
    │  ├─ protocol.md              accoreconsole 协议与回执格式
    │  ├─ troubleshooting.md       诊断树
    │  └─ install.md               各平台安装细节
    └─ scripts/
       ├─ CadCommon.ps1            公共库（31 个函数）
       ├─ CadCompiler.ps1          JSON → LISP
+      ├─ CadEvidence.ps1          证据分级 / 五态结论 / manifest / 单位与图层
+      ├─ CadSpecCheck.ps1         出图前 spec 预检
+      ├─ CadPdf.ps1               PDF 内容流解析 → DXF
+      ├─ CadImage.ps1             图片像素与墨迹分析
       ├─ cadcore.lsp              LISP 命令库（51 个 c:XXX）
       ├─ Invoke-CadDraw.ps1       出图主入口
       ├─ Invoke-CadInspect.ps1    体检
@@ -407,12 +498,14 @@ cad-automatic-wwj/
 
 ```
 JSON spec
+  → Test-CadSpec.ps1 出图前预检（负半径 / 宽 0 / 坐标爆表 / 重复 id）
   → CadCompiler.ps1 编译成 LISP 调用序列
   → 写盘（GBK/CRLF）为 drawing.lsp
   → 写盘（GBK/CRLF）为 draw.scr：加载 LISP → 执行 → SAVEAS/DXFOUT/PLOT → QUIT
   → accoreconsole /i blank.dwg /s draw.scr
   → 读 stdout（UTF-16LE）抓 @@KEY=value@@ 回执
   → 独立校验产物字节（DWG 头 / DXF 结构 / PDF 结构）
+  → 出 manifest：spec 与 cadcore 的 SHA-256 + 产物哈希，供下次比对
 ```
 
 选 `accoreconsole` 而不是 COM 的原因：无界面、启动快（约 4 秒 vs 25 秒）、不需要 `acad.exe`、不会被弹窗卡住、进程退出干净。COM 只作为备用通道。

@@ -19,13 +19,15 @@
     export  —— 导出：DWG → DXF 各版本
     plot    —— 打印：改方向/图纸尺寸
     repair  —— 修复：故意造坏再让它修
+    evidence —— 证据链与清单：五态结论 + manifest 自比对
+    pdf2dxf  —— PDF 矢量路径 → DXF
 
 .PARAMETER KeepArtifacts
     保留临时工作目录（默认清理，只留报告里记的产物路径）。
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'draw', 'inspect', 'export', 'plot', 'repair')]
+    [ValidateSet('all', 'draw', 'inspect', 'export', 'plot', 'repair', 'evidence', 'pdf2dxf')]
     [string]$Test = 'all',
 
     [string]$OutputDirectory = (Join-Path ([IO.Path]::GetTempPath()) 'cad-integration-tests'),
@@ -47,6 +49,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'CadCommon.ps1')
+. (Join-Path $PSScriptRoot 'CadEvidence.ps1')
+. (Join-Path $PSScriptRoot 'CadPdf.ps1')
 
 $skillRoot = Split-Path -Parent $PSScriptRoot
 $drawScript = Join-Path $PSScriptRoot 'Invoke-CadDraw.ps1'
@@ -54,8 +58,9 @@ $inspectScript = Join-Path $PSScriptRoot 'Invoke-CadInspect.ps1'
 $exportScript = Join-Path $PSScriptRoot 'Export-CadToDxf.ps1'
 $plotScript = Join-Path $PSScriptRoot 'Invoke-CadPlot.ps1'
 $repairScript = Join-Path $PSScriptRoot 'Invoke-CadRepair.ps1'
+$pdf2dxfScript = Join-Path $PSScriptRoot 'Convert-CadPdfToDxf.ps1'
 
-foreach ($f in @($drawScript, $inspectScript, $exportScript, $plotScript, $repairScript)) {
+foreach ($f in @($drawScript, $inspectScript, $exportScript, $plotScript, $repairScript, $pdf2dxfScript)) {
     if (-not (Test-Path -LiteralPath $f)) { throw "缺少必需脚本: $f" }
 }
 
@@ -483,6 +488,180 @@ try {
             $o2 = $null; try { $o2 = $r2 | ConvertFrom-Json } catch { }
             Add-Check 'repair.DryRun 模式标记' ($o2 -and $o2.mode -eq 'dry-run') $(if ($o2) { "mode=$($o2.mode)" } else { '解析失败' })
             Add-Check 'repair.DryRun 不删文件' (Test-Path -LiteralPath $dryDwg) '文件应保留'
+        }
+    }
+
+    # ══════════════════════════════════════════════════════════════
+    #  例程 7：证据链与清单 —— 五态结论 + manifest 自比对
+    #
+    #  这一例程不启动 accoreconsole：证据分级、五态结论、manifest 全是
+    #  纯逻辑，放在集成测试里是为了证明「draw 例程产出的那份清单
+    #  真的能被读回来、真的能检出差异」。
+    # ══════════════════════════════════════════════════════════════
+    if ($Test -in @('all', 'evidence')) {
+        Section '7. 证据链与清单：五态结论 + manifest'
+        Assert-Budget 'evidence' 20 | Out-Null
+
+        $evDir = Join-Path $runDir 'evidence'
+        New-Item -ItemType Directory -Path $evDir -Force | Out-Null
+
+        # 五态优先级：blocked > fail > needs_review > pass_with_warnings > pass
+        $evKnown    = New-CadEvidence -Kind 'test' -Level 'known'    -Message '直接读到' -Source 'run-test'
+        $evScaled   = New-CadEvidence -Kind 'test' -Level 'scaled'   -Message '换算得到' -Source 'run-test'
+        $evInferred = New-CadEvidence -Kind 'test' -Level 'inferred' -Message '推断'     -Source 'run-test'
+        $evUnread   = New-CadEvidence -Kind 'test' -Level 'unreadable' -Message '读不到' -Source 'run-test'
+
+        $allOk = @([pscustomobject]@{ name = 'a'; pass = $true })
+        $oneFail = @([pscustomobject]@{ name = 'a'; pass = $true }, [pscustomobject]@{ name = 'b'; pass = $false })
+
+        Add-Check 'evidence.全 known → pass' ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown)) -eq 'pass') ''
+        Add-Check 'evidence.有 warning → pass_with_warnings' `
+            ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown) -Warnings @('线型回落')) -eq 'pass_with_warnings') ''
+        Add-Check 'evidence.unreadable → needs_review' `
+            ((Get-CadDisposition -Checks $allOk -Evidence @($evKnown, $evUnread)) -eq 'needs_review') ''
+        Add-Check 'evidence.error 且有产物 → fail（不升级 blocked）' `
+            ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown) -Error '炸了' -Artifacts @(@{ kind = 'dwg'; exists = $true })) -eq 'fail') ''
+        # blocked 与 fail 的分界不是「有没有产物」，而是「有没有给出阻塞原因」：
+        #   blocked = 明确知道为什么跑不下去（环境缺失、输入不可读），给出原因
+        #   fail    = 真的跑了但结果不对
+        # 产物存在与否只影响调用方能不能救回半成品，不改变结论档位。
+        Add-Check 'evidence.有阻塞原因 → blocked' `
+            ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown) -Error '炸了' -Artifacts @() -BlockedReason 'accoreconsole 定位不到') -eq 'blocked') ''
+        Add-Check 'evidence.无阻塞原因 → fail' `
+            ((Get-CadDisposition -Checks $oneFail -Evidence @($evKnown) -Error '炸了' -Artifacts @()) -eq 'fail') ''
+
+        # manifest：写一份、读回来、自比对 identical，再改一个数让它检出差异
+        $manSpec = Join-Path $evDir 'manifest-spec.json'
+        $manBody = @{ units = 'mm'; entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0) }) }
+        [IO.File]::WriteAllText($manSpec, ($manBody | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+
+        $manPath = Join-Path $evDir 'manifest.json'
+        $artifact = Join-Path $evDir 'artifact.dwg'
+        [IO.File]::WriteAllBytes($artifact, ([byte[]](1..64)))
+        $man = New-CadManifest -SpecFile $manSpec -Spec $manBody -DrawingName 'evidence-probe' `
+            -Artifacts @(@{ kind = 'dwg'; path = $artifact }) -Evidence @($evKnown) `
+            -Disposition 'pass' -Units 'mm' -UnitsCode 4 -EntityCount 1 -Layers @('GEO')
+        Add-Check 'manifest.specSha256 已算' ([string]$man.specSha256).Length -eq 64 "specSha256=$($man.specSha256)"
+        Add-Check 'manifest.cadCoreSha256 已算' ([string]$man.cadCoreSha256).Length -eq 64 "cadCoreSha256=$($man.cadCoreSha256)"
+
+        $wrote = Write-CadManifest -Manifest $man -Path $manPath
+        Add-Check 'manifest 落盘' ([string]$wrote -eq $manPath -and (Test-Path -LiteralPath $manPath)) "path=$wrote"
+
+        $cmp = $null
+        # Compare-CadManifest 吃的是两个清单**对象**（-Before / -After），
+        # 不是文件路径。先读回来再比 —— 这样也顺带验了 Write 落盘的 JSON
+        # 能被读回成同一份清单（复现链条的最后一环）。
+        $readBack = $null
+        try { $readBack = (Get-Content -LiteralPath $manPath -Raw -Encoding UTF8) | ConvertFrom-Json } catch { }
+        if ($readBack) { $cmp = Compare-CadManifest -Before $readBack -After $man }
+        Add-Check 'manifest 自比对 identical' ($cmp -and $cmp.identical) $(if ($cmp) { "diffs=$($cmp.diffCount)" } else { '读不到' })
+
+        # 改实体数后必须检出差异
+        if ($readBack) {
+            $man2 = $readBack.PSObject.Copy()
+            $man2 | Add-Member -NotePropertyName 'entityCount' -NotePropertyValue 99 -Force
+            $cmp2 = Compare-CadManifest -Before $man -After $man2
+            $diffText = @($cmp2.diffs | ForEach-Object { $_.field }) -join ','
+            Add-Check 'manifest 检出实体数差异' ($cmp2 -and -not $cmp2.identical -and $diffText -match 'entityCount') "diffs=$diffText"
+        } else {
+            Add-Check 'manifest 检出实体数差异' $false '清单读不回来'
+        }
+    }
+
+    # ══════════════════════════════════════════════════════════════
+    #  例程 8：PDF 矢量路径 → DXF
+    #
+    #  用上一例程留下的真 PDF（plot 或 draw 的产物）当输入。
+    #  没有可用 PDF 时自己造一个只含矢量内容流的简易 PDF，
+    #  不让这一例程因为前一个例程被跳过而失效。
+    # ══════════════════════════════════════════════════════════════
+    if ($Test -in @('all', 'pdf2dxf')) {
+        Section '8. PDF 矢量路径 → DXF'
+        Assert-Budget 'pdf2dxf' 30 | Out-Null
+
+        $pdfDir = Join-Path $runDir 'pdf2dxf'
+        New-Item -ItemType Directory -Path $pdfDir -Force | Out-Null
+
+        # 优先用本套例程自己产出的真 PDF（最有说服力）
+        $srcPdf = $null
+        foreach ($cand in @(
+            (Join-Path $runDir 'plot\plot-a3-portrait.pdf'),
+            (Join-Path $runDir 'draw\integration-draw.pdf')
+        )) {
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $srcPdf = $cand; break }
+        }
+
+        $madePdf = $false
+        if (-not $srcPdf) {
+            # 自造：一条折线 + 一个矩形，只画不填。Flate 不用（避免依赖
+            # 压缩流是否可解），直接写未压缩内容流 —— 解析器两条路都支持。
+            $content = "1 0 0 RG 1 w`n10 10 m 100 10 l 100 60 l 10 60 l s`n120 10 40 40 re S`n"
+            $cb = [Text.Encoding]::ASCII.GetBytes($content)
+            $objs = New-Object System.Collections.Generic.List[string]
+            $objs.Add('1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj')
+            $objs.Add('2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj')
+            $objs.Add('3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R>>endobj')
+            $objs.Add("4 0 obj<</Length $($cb.Length)>>stream`n$($content)endstream endobj")
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('%PDF-1.4' + "`n")
+            $offsets = New-Object System.Collections.Generic.List[int]
+            $body = New-Object System.Text.StringBuilder
+            for ($i = 0; $i -lt $objs.Count; $i++) {
+                $offsets.Add($sb.Length + $body.Length) | Out-Null
+                [void]$body.Append($objs[$i] + "`n")
+            }
+            [void]$sb.Append($body.ToString())
+            $xrefPos = $sb.Length
+            [void]$sb.Append("xref`n0 $($objs.Count + 1)`n0000000000 65535 f `n")
+            foreach ($off in $offsets) { [void]$sb.Append(("{0:d10} 00000 n `n" -f $off)) }
+            [void]$sb.Append("trailer<</Size $($objs.Count + 1)/Root 1 0 R>>`nstartxref`n$xrefPos`n%%EOF`n")
+            $srcPdf = Join-Path $pdfDir 'synthetic.pdf'
+            [IO.File]::WriteAllBytes($srcPdf, [Text.Encoding]::ASCII.GetBytes($sb.ToString()))
+            $madePdf = $true
+        }
+
+        $pdfInfo = Get-CadPdfInfo -Path $srcPdf
+        Add-Check 'pdf2dxf.源 PDF 可读' ([string]$pdfInfo.version -match '^\d+\.\d+$') `
+            $(if ($srcPdf) { "version=$($pdfInfo.version) pages=$($pdfInfo.pageCount) streams=$($pdfInfo.streamCount) madeSelf=$madePdf" } else { '无源 PDF' })
+
+        $outDxf = Join-Path $pdfDir 'vector.dxf'
+        # Convert-CadPdfToDxf 是纯本地解析，不启动任何进程 —— 没有
+        # -TimeoutSeconds 参数。给它传超时只会报「找不到参数」。
+        $r = & $pdf2dxfScript -Path $srcPdf -Output $outDxf -AsJson 2>&1 | Out-String
+        $o = $null; try { $o = $r | ConvertFrom-Json } catch { }
+        if (-not $o) {
+            Add-Check 'pdf2dxf 可解析' $false ($r.Trim())
+        } else {
+            $report.sections += 'pdf2dxf'
+            # status ∈ ok | parsed（没指定 -Output）| empty（没解析出路径）
+            Add-Check 'pdf2dxf.status' ($o.status -in @('ok', 'parsed')) "status=$($o.status)"
+            Add-Check 'pdf2dxf 解析出路径' ($o.pathCount -ge 1) "pathCount=$($o.pathCount) stroke=$($o.strokePaths) fill=$($o.fillPaths)"
+            Add-Check 'pdf2dxf DXF 落地' ((Test-Path -LiteralPath $outDxf) -and ((Get-Item -LiteralPath $outDxf).Length -gt 512)) `
+                $(if (Test-Path -LiteralPath $outDxf) { "$((Get-Item -LiteralPath $outDxf).Length) 字节 entities=$($o.entities)" } else { '未生成' })
+            $dxfChk2 = $null
+            if (Test-Path -LiteralPath $outDxf) { $dxfChk2 = Test-CadDxfFile -Path $outDxf }
+            Add-Check 'pdf2dxf DXF 结构有效' ($dxfChk2 -and $dxfChk2.valid) `
+                $(if ($dxfChk2) { "valid=$($dxfChk2.valid) 实体=$($dxfChk2.entityCount) 版本=$($dxfChk2.version)" } else { '未生成' })
+
+            # 坐标必须落在 MediaBox 内 —— 这是 CTM 丢失 bug 的直接哨兵
+            $mb = @($pdfInfo.mediaBox)
+            $inBox = $true
+            if ($o.extents) {
+                $w = [double]$pdfInfo.mediaBox[2]; $h = [double]$pdfInfo.mediaBox[3]
+                $minX = [double]$o.extents.minX; $minY = [double]$o.extents.minY
+                $maxX = [double]$o.extents.maxX; $maxY = [double]$o.extents.maxY
+                $inBox = ($minX -ge -0.5) -and ($minY -ge -0.5) -and ($maxX -le ($w + 0.5)) -and ($maxY -le ($h + 0.5))
+            }
+            Add-Check 'pdf2dxf 范围落在 MediaBox 内（CTM 未丢失）' $inBox `
+                $(if ($o.extents) { "extents=($($o.extents.minX),$($o.extents.minY))–($($o.extents.maxX),$($o.extents.maxY)) mediaBox=$($pdfInfo.mediaBox -join ',')" } else { '无 extents' })
+
+            # 读回来的实体必须真的在目标图层上
+            if (Test-Path -LiteralPath $outDxf) {
+                $pEnts = @(Get-CadDxfEntities -Path $outDxf -Limit 5000)
+                $pLayers = @($pEnts | ForEach-Object { [string]$_.layer } | Sort-Object -Unique)
+                Add-Check 'pdf2dxf 图层为 PDF_STROKE' (($pLayers -join ',') -eq 'PDF_STROKE' -or ($pLayers -contains 'PDF_STROKE')) `
+                    ("layers=" + ($pLayers -join ',') + " entities=" + $pEnts.Count)
+            }
         }
     }
 
