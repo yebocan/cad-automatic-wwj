@@ -176,6 +176,20 @@ $s = "<skill>\scripts"
 
 `Invoke-CadVisualCompare.ps1`：`-Dxf`（必填，重建产物）、参照二选一 `-ReferenceDxf`（几何模式）或 `-ReferenceImage`（像素模式，需配 `-Preview`）、`-GeometryTolerance`（默认 0.01）、`-PixelTolerance`（默认 32）、`-AsJson`。几何模式查四项：实体总数 / 类型分布 / 图层集合 / 逐实体坐标配对，全部 `known` 级；像素模式走 `Compare-CadImage` 粗判，`inferred` 级，结论档位不会高过 `needs_review`——这是故意的：像素像不等于尺寸对。
 
+### 锚点配准比对（像素级精配准）
+
+```powershell
+& "$s\Invoke-CadAnchorCompare.ps1" -Source photo.png -CadPreview preview.png -Anchors anchors.json -OutputDir cmp
+```
+
+当「重画图 vs 原图」需要比 `Invoke-CadVisualCompare` 像素模式更准的视觉结论时用这个：给 ≥4 对锚点（`anchors.json`：`source_points` 源图像素坐标 + `cad_points` CAD 预览像素坐标），脚本解 3×3 单应（归一化 DLT + 高斯消元，零 Python 依赖），把 CAD 预览双线性重采样回源图坐标系，再对两图各提 Sobel 边缘、跑两遍 chamfer 距离，输出双向中位/P95 距离和 {3,5,10}px 覆盖率 + `registered-cad.png` + `metrics.json`。支持多视图：`{"views":[{...,"source_roi":[l,t,r,b]}]}` 每视图独立配准、按 ROI 合成到一张 composite（白底 255 + coverage 掩码，未覆盖区填白）。
+
+- `homographyInliers`：残差 ≤4px 的锚点数，<4 说明锚点本身矛盾，先别看距离数字。
+- `cadToSourceMedianPx`：重画边缘到源边缘的中位距离——**线画得像不像**的主要指标。
+- `sourceEdgeCoverage`：源边缘被重画覆盖的比例——**有没有漏线**。
+- 指标口径是 `visual_registration_only`，警告写死在输出里：像素配准永远证明不了物理尺寸，尺寸证据必须走 DXF 实体级比对。
+- PS 实现坑（改动前必读）：数组字面量 `@()` 内一元负号表达式 `-$a*$b` 会被静默解析成 `-$a`（乘法项被吞）——一律先赋临时变量；函数参数与循环变量不得仅大小写不同（`foreach ($p in $P)` 里 `$p`/`$P` 是同一变量，迭代时自赋值破坏枚举）。
+
 ## 导出与打印层
 
 ```powershell
@@ -205,7 +219,17 @@ $s = "<skill>\scripts"
 
 位图 PDF（只含 DCTDecode XObject）会明确报「没找到可解析的矢量内容流，这多半是扫描件，需要先 OCR/矢量化」，exit 1——**不猜、不画一个空图交差**。
 
-## 图片预检
+## 图片预检（两道关卡）
+
+**第 1 道专检「这张图配不配当重绘参考」**（对方 skill 的 preflight_image_redraw 思路，纯 .NET 实现）：
+
+```powershell
+& "<skill>\scripts\Add-CadImagePreflight.ps1" -Path "photo.png" -Output report.json
+```
+
+参数：`-Path`（必填）、`-MinShortEdge`（默认 700）、`-MinContrast`（默认 18，灰度标准差）、`-MinLapVar`（默认 45，拉普拉斯方差=锐度）、`-Output`（JSON 报告）、`-AsJson`。五项检查全零依赖：尺寸（System.Drawing 直接读）、灰度 σ、采样步长 2 的拉普拉斯方差、纸面判定（亮像素占比 ≥15% 或暗像素 ≥2% 判「非纸面」警告）、EXIF 旋转标记。结论三档：`pass` / `pass_with_warnings` / `blocked`（短边 < 700 直接 blocked——低分辨率图重绘出来注定糊）。报告带源文件 SHA-256，可与后续比对报告互相对账。
+
+**第 2 道是通用图像信息**：
 
 ```powershell
 & "<skill>\scripts\Get-CadImageInfo.ps1" -Path "photo.png" -AsJson
