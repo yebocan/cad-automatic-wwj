@@ -1,4 +1,4 @@
-﻿# 命令清单
+# 命令清单
 
 所有脚本都在 `scripts\` 下，都用 `pwsh` 跑。共同惯例：
 
@@ -112,6 +112,38 @@
 - `checks[].pass` 是 **`pass`** 不是 `passed`
 - `markers` 是从 stdout 里抓的 `@@NAME=value@@` / `@@NAME@@` 回执
 - `exitName` 是 accoreconsole 退出码的语义名：`success` / `drawing-not-found` / `crash` / `timeout` / `other`
+
+### 多视图模式（spec 带 `views[]` 时自动启用）
+
+拆分规则与校验规则见 [spec.md](spec.md) 的「多视图 `views[]`」。报告差异：
+
+```json
+{
+  "status": "ok",
+  "disposition": "pass",
+  "multiView": true,
+  "entityCount": 4,
+  "warnings": ["[视图 front] …"],
+  "views": [
+    {
+      "id": "front",
+      "name": "主视图",
+      "status": "dry-run",
+      "disposition": "needs_review",
+      "entityCount": 3,
+      "artifacts": { "dwg": "...\\front-bracket.dwg", "dxf": "..." },
+      "manifest": "...\\manifest-front.json",
+      "error": null,
+      "report": { /* 该视图的完整单视图报告 */ }
+    }
+  ]
+}
+```
+
+- 顶层 `status` / `disposition` 取所有视图的**最差档**（fail > blocked > needs_review > pass_with_warnings > pass）
+- `entityCount` 是各视图之和
+- 视图级 warning 前缀 `[视图 <id>]`
+- 某视图 `blocked`（校验失败等）时其余视图照常执行，顶层如实 `blocked`、exit 4
 
 ```powershell
 # 标准用法
@@ -423,8 +455,14 @@
 | 重复 `id` | 点名重复的 id |
 | 重复图层 | 点名重复的图层名 |
 | `constraints` 冲突 | `maxEntities` 等超限 |
+| 多视图：`views[].id` 缺失/重复 | `视图 id 'X' 重复（views[i] 与 views[j]）`（不区分大小写） |
+| 多视图：`view_id` 引用未知视图 | `entities[i] 的 view_id='X' 没有对应的 views[] 条目` |
+| 多视图：`required_view_ids` 未知 | `constraints.required_view_ids 里的视图 'X' 没有在 views[] 里定义` |
+| 多视图：视图内实体缺字段 | `views[i](vid).entities[j](type) 缺少必需字段 …` |
 
-**只记 warning 不挡路**：未声明图层（编译器会自动补建）、缺 `units`、非法 `units`、非法 `dxfVersion`（都会给出回落值）。
+`entities` 与 `views` 都为空仍然报错；`entities` 空但 `views` 非空放行（每个视图至少要有共享或本地实体才有东西画）。
+
+**只记 warning 不挡路**：未声明图层（编译器会自动补建）、缺 `units`、非法 `units`、非法 `dxfVersion`、**视图内实体引用未声明图层**（同样自动补建，错误信息带 `views[i]` 定位）。
 
 ```powershell
 .\Test-CadSpec.ps1 -SpecFile .\flange.json -AsJson
@@ -488,6 +526,58 @@
 支持 `m/l/c/v/y/re/h` 路径算子、`S/s/f/F/f*/B/B*/b/b*/n` 上色算子、`q/Q/cm/w` 图形状态，FlateDecode 与 AsciiHex 过滤器。产物是 R12（AC1009）DXF：两点出 `LINE`，多点亮式 `POLYLINE`（`66=1` + VERTEX + SEQEND）。
 
 **位图 PDF 会明确报错**：只含 DCTDecode XObject 时报「没找到可解析的矢量内容流，这多半是扫描件，需要先 OCR/矢量化」，exit 1。**不猜、不画一个空图交差。**
+
+---
+
+## 9b. `Invoke-CadRenderPreview.ps1` — DXF 预览渲染（不开 CAD）
+
+```powershell
+.\Invoke-CadRenderPreview.ps1 -Dxf <dxf> [-OutputDir <dir>] [-Page <A4|A3|A2|A1=A4>]
+                              [-Orientation <landscape|portrait> [-MarginMm <double=10>]
+                              [-Dpi <int=300>] [-NoPng] [-NoPdf] [-AsJson]
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-Dxf` | **必填** | ASCII DXF 路径 |
+| `-OutputDir` | DXF 同目录 | 产物目录 |
+| `-Page` | `A4` | 画布页幅：A4 297×210 / A3 420×297 / A2 594×420 / A1 841×594（mm，横放基准） |
+| `-Orientation` | `landscape` | `portrait` 时宽高互换 |
+| `-MarginMm` | `10` | 页边距；内容超出画布时按边界收进并记 warning |
+| `-Dpi` | `300` | PNG 分辨率（PDF 恒为矢量） |
+| `-NoPng` / `-NoPdf` | — | 关掉对应产物 |
+
+**零进程**：不启动 accoreconsole、不碰 COM，纯 PowerShell + System.Drawing。底层在 `CadRender.ps1`：`Get-CadDxfRenderData`（解析+审计）与 `Invoke-CadDxfPreviewRender`（渲染）。
+
+**报告字段**（对齐上游 render_dxf_preview.py 口径）：
+
+```json
+{
+  "tool": "Invoke-CadRenderPreview/1.0",
+  "status": "pass_with_warnings",
+  "dxf": "...\\all-entities.dxf",
+  "sha256": "45b28103…",
+  "version": "AC1032",
+  "encoding": "utf-8",
+  "audit_errors": [],
+  "audit_fixes": [],
+  "entityTotal": 25,
+  "blockTotal": 0,
+  "entity_counts": { "CIRCLE": 9, "LINE": 3, "LWPOLYLINE": 4, "MTEXT": 1, "TEXT": 1, "…": "…" },
+  "layer_counts": { "GEO": 8, "HOLE": 9, "TXT": 2, "…": "…" },
+  "extents": { "minX": 0, "minY": 0, "maxX": 275, "maxY": 120 },
+  "page_mm": { "width": 420, "height": 297 },
+  "dpi": 300,
+  "artifacts": [ { "kind": "png", "path": "...", "bytes": 223920 } ],
+  "warnings": ["PDF 预览里 1 处文字含中文/非 Latin-1 字符，已替换为 '?'（基础 14 字体不含中文；PNG 预览不受影响）"],
+  "exitCode": 0,
+  "durationMs": 1644
+}
+```
+
+退出码：`0` = pass / pass_with_warnings，`3` = blocked（DXF 结构错误，如缺 ENTITIES 段、缺 EOF），`1` = 异常。
+
+**中文边界**：PDF 用 14 个 PDF 基础字体，不含中文——文字含非 Latin-1 字符时 PNG 照常、PDF 里替换为 `?` 并写 warning。要中文 PDF 走 `Invoke-CadPlot.ps1`。
 
 ---
 
@@ -741,6 +831,8 @@ $diff = Compare-CadManifest -Before $back -After $man
 | `Convert-CadPdfToDxf` | ok / parsed | empty | 其它 |
 | `Invoke-CadCom` | ok / partial | — | 其它 |
 | `Invoke-CadRepair` | healthy / repaired | issues | 其它 |
+| `Invoke-CadRenderPreview` | pass / pass_with_warnings | —（`3` = blocked：DXF 结构错误） | 其它 |
+| `Invoke-CadDraw`（多视图顶层 blocked） | — | — | `4` = blocked（某视图校验失败；其余视图照常执行） |
 
 accoreconsole 自己的退出码另有一套：
 

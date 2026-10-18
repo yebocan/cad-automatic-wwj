@@ -112,7 +112,7 @@ function Write-CadReport {
     }
 }
 
-function Invoke-CadDraw {
+function Invoke-CadDrawSingle {
     param(
         [string]$SpecFile,
         [string]$SpecJson,
@@ -649,6 +649,160 @@ function Invoke-CadDraw {
     return $report
 }
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 多视图薄包装：spec 顶层有 views[] 时逐视图出图并聚合报告
+# ═══════════════════════════════════════════════════════════════════
+# 单视图 spec 走 Invoke-CadDrawSingle，行为与旧版完全一致（65 项集成
+# 测试的基线）。多视图 spec 拆成 N 份子 spec 逐个画，每份独立产物与
+# manifest；聚合成一份顶层报告：views[].report + 汇总 status/disposition。
+function Invoke-CadDraw {
+    param(
+        [string]$SpecFile,
+        [string]$SpecJson,
+        [string]$OutputDir,
+        [string]$Dwg,
+        [switch]$DryRun,
+        [switch]$KeepArtifacts,
+        [switch]$AsJson,
+        [int]$TimeoutSeconds = 180,
+        [string]$AccoreConsole,
+        [switch]$SkipPrecheck,
+        [string]$ExpectedUnits,
+        [string[]]$RequiredLayers,
+        [string]$Manifest,
+        [string]$CompareManifest
+    )
+
+    $started = Get-Date
+
+    # 读 spec（与单视图入口同样的三种来源）
+    if ($SpecFile) {
+        if (-not (Test-Path -LiteralPath $SpecFile -PathType Leaf)) {
+            throw "图纸描述文件不存在: $SpecFile"
+        }
+        $raw = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SpecFile).Path, [Text.Encoding]::UTF8)
+        $spec = $raw | ConvertFrom-Json
+    } elseif ($SpecJson) {
+        $spec = $SpecJson | ConvertFrom-Json
+    } else {
+        throw '需要 -SpecFile 或 -SpecJson'
+    }
+    if ($null -eq $spec) { throw 'JSON 解析结果为空' }
+
+    # 没有 views[] → 原路进单视图，报告形状不变
+    $hasViews = $null -ne (Get-CadField $spec 'views')
+    if (-not $hasViews) {
+        $args1 = @{
+            SpecFile = $SpecFile; SpecJson = $SpecJson; OutputDir = $OutputDir
+            Dwg = $Dwg; DryRun = $DryRun; KeepArtifacts = $KeepArtifacts
+            TimeoutSeconds = $TimeoutSeconds; AccoreConsole = $AccoreConsole
+            SkipPrecheck = $SkipPrecheck; ExpectedUnits = $ExpectedUnits
+            RequiredLayers = $RequiredLayers; CompareManifest = $CompareManifest
+        }
+        if ($PSBoundParameters.ContainsKey('Manifest')) { $args1.Manifest = $Manifest }
+        return Invoke-CadDrawSingle @args1
+    }
+
+    # ── 多视图：拆分 + 逐视图调用 ──
+    $subSpecs = Get-CadSpecViewSpecs -Spec $spec
+    if (@($subSpecs).Count -eq 0) { return (Invoke-CadDrawSingle -SpecJson ($spec | ConvertTo-Json -Depth 20) -OutputDir $OutputDir -Dwg $Dwg -DryRun:$DryRun -KeepArtifacts:$KeepArtifacts -TimeoutSeconds $TimeoutSeconds -AccoreConsole $AccoreConsole -SkipPrecheck:$SkipPrecheck -ExpectedUnits $ExpectedUnits -RequiredLayers $RequiredLayers -CompareManifest $CompareManifest) }
+
+    $viewsList = New-Object System.Collections.Generic.List[object]
+    $allWarnings = New-Object System.Collections.Generic.List[string]
+    $worstStatus = 'ok'
+    $statusRank = @{ 'failed' = 4; 'blocked' = 3; 'partial' = 2; 'dry-run' = 1; 'ok' = 0 }
+    $worstDisposition = 'pass'
+    $dispRank = @{ 'fail' = 4; 'blocked' = 3; 'needs_review' = 2; 'pass_with_warnings' = 1; 'pass' = 0 }
+    $totalEntity = 0
+    $totalDuration = 0
+
+    $si = 0
+    foreach ($sub in @($subSpecs)) {
+        $vid = ([string](Get-CadField $sub 'name' "view$si")) -replace ('^' + [regex]::Escape([string](Get-CadField $spec 'name' 'drawing')) + '-'), ''
+        if (-not $vid) { $vid = "view$si" }
+
+        $r = $null
+        try {
+            $argsV = @{
+                SpecJson       = $sub | ConvertTo-Json -Depth 20
+                OutputDir      = $OutputDir
+                DryRun         = $DryRun
+                KeepArtifacts  = $KeepArtifacts
+                TimeoutSeconds = $TimeoutSeconds
+                AccoreConsole  = $AccoreConsole
+                SkipPrecheck   = $SkipPrecheck
+                ExpectedUnits  = $ExpectedUnits
+            }
+            if ($RequiredLayers) { $argsV.RequiredLayers = $RequiredLayers }
+            # Manifest 留给单视图自己按 OutputDir 落盘（每个视图独立 manifest.json
+            # 会互相覆盖，所以这里不传，让单视图默认写到同一 OutputDir —— 但
+            # 单视图的默认 manifest 名相同会覆盖，因此多视图时显式给每视图一个）
+            $argsV.Manifest = if ($OutputDir) { Join-Path $OutputDir "manifest-$vid.json" } else { "manifest-$vid.json" }
+            $r = Invoke-CadDrawSingle @argsV
+        } catch {
+            $r = [pscustomobject][ordered]@{
+                status = 'failed'; disposition = 'fail'; advice = $null
+                drawing = $vid; entityCount = 0; layers = @(); artifacts = @()
+                checks = @(); warnings = @($($_.Exception.Message)); error = $_.Exception.Message
+                logDir = $null; exitCode = $null; exitName = $null; timedOut = $false
+                markers = [ordered]@{}; units = $null; unitsCheck = $null
+                layersCheck = $null; evidence = @(); manifest = $null; compare = $null
+                durationMs = 0
+            }
+        }
+
+        foreach ($w in @($r.warnings)) { $allWarnings.Add("[视图 $vid] $w") }
+
+        if ($statusRank[[string]$r.status] -gt $statusRank[$worstStatus]) { $worstStatus = [string]$r.status }
+        $rd = [string]$r.disposition
+        if (-not $dispRank.ContainsKey($rd)) { $rd = 'needs_review' }
+        if ($dispRank[$rd] -gt $dispRank[$worstDisposition]) { $worstDisposition = $rd }
+
+        $totalEntity += [int]$r.entityCount
+        $totalDuration += [int]$r.durationMs
+
+        $viewsList.Add([pscustomobject][ordered]@{
+            id          = $vid
+            name        = $r.drawing
+            status      = $r.status
+            disposition = $r.disposition
+            entityCount = $r.entityCount
+            artifacts   = $r.artifacts
+            manifest    = $r.manifest
+            error       = $r.error
+            report      = $r
+        })
+        $si++
+    }
+
+    return [pscustomobject][ordered]@{
+        status      = $worstStatus
+        disposition = $worstDisposition
+        advice      = Get-CadDispositionAdvice -Disposition $worstDisposition
+        drawing     = [string](Get-CadField $spec 'name' 'drawing')
+        entityCount = $totalEntity
+        layers      = @()
+        artifacts   = @($viewsList | ForEach-Object { $_.artifacts })
+        checks      = @()
+        warnings    = $allWarnings.ToArray()
+        error       = $null
+        logDir      = $null
+        exitCode    = $null
+        exitName    = $null
+        timedOut    = $false
+        markers     = [ordered]@{}
+        units       = $null
+        unitsCheck  = $null
+        layersCheck = $null
+        evidence    = @()
+        manifest    = $null
+        compare     = $null
+        durationMs  = [int]((Get-Date) - $started).TotalMilliseconds
+        multiView   = $true
+        views       = $viewsList.ToArray()
+    }
+}
 # ── 入口 ──────────────────────────────────────────────────────────
 $drawArgs = @{
     SpecFile        = $SpecFile

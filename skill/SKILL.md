@@ -1,6 +1,6 @@
----
+﻿---
 name: cad-automatic-wwj
-description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
+description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、不开 CAD 把 DXF 渲染成 PNG/PDF 预览、spec 一份多视图拆分出多张图、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
 ---
 
 # CAD Automatic WWJ
@@ -19,6 +19,8 @@ description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动�
 - **"导成 PDF / 打印 / 出图给客户"**：用 [scripts/Invoke-CadPlot.ps1](scripts/Invoke-CadPlot.ps1)。产物会过 `%PDF` 头 + `%%EOF` + 页数三重校验。
 - **"画是画出来了但有毛病 / 文件 0 字节 / 打不开"**：走出图修复层，用 [scripts/Invoke-CadRepair.ps1](scripts/Invoke-CadRepair.ps1)。先 `-DryRun` 看诊断，再决定修不修。
 - **"要看见 AutoCAD 窗口 / 交互操作 / 已经有图开着"**：走 COM 通道，用 [scripts/Invoke-CadCom.ps1](scripts/Invoke-CadCom.ps1)。它驱动真正运行着的 `acad.exe`，约 25 秒起一次，比 accoreconsole 慢一个量级，只在需要界面时才用。
+- **"不开 CAD 看一眼 DXF 长什么样 / 出 PNG、PDF 预览"**：用 [scripts/Invoke-CadRenderPreview.ps1](scripts/Invoke-CadRenderPreview.ps1)。见下面「DXF 预览渲染」。
+- **"一张图要出正视、俯视等多个视图"**：spec 写 `views[]`，Invoke-CadDraw 自动拆成多张图。见下面「spec 多视图」。
 - **"装在哪 / 换台机器怎么用 / 找不到 accoreconsole"**：读 [references/install.md](references/install.md)。**路径不写死，靠解析链找。**
 - **"试一下能不能用 / 演示 / 证明它真的能画"**：跑下面「三套测试套件」里的命令。**别用「窗口弹出来了」当证据。**
 
@@ -270,13 +272,47 @@ $dxf = Write-CadImageDxf -Geometry $geo -Output "out.dxf" -Scale 0.1
 - **Y 轴必须翻**：像素 y 向下增、图纸 y 向上增，不翻则上下颠倒且不报错。
 - `-Scale` 不给就按 1:1 并 warning「没有物理比例」；知道图里某条线实际长度时传 `-KnownWidth` 换算。
 
-## 出图前 spec 预检
+## DXF 预览渲染（不开 CAD）
+
+```powershell
+& "<skill>\scripts\Invoke-CadRenderPreview.ps1" -Dxf "out.dxf" -Page A3 -OutputDir "D:\preview" -AsJson
+```
+
+不启动任何进程，把 ASCII DXF 渲染成 PNG + PDF 预览。参数：`-Dxf`（必填）、`-OutputDir`（默认 DXF 同目录）、`-Page`（`A4`/`A3`/`A2`/`A1`，默认 A4）、`-Orientation`（`landscape`/`portrait`）、`-MarginMm`（默认 10）、`-Dpi`（默认 300）、`-NoPng`/`-NoPdf`、`-AsJson`。退出码：0 = pass / pass_with_warnings，3 = blocked（DXF 结构错误），1 = 异常。
+
+实现分两层：[CadRender.ps1](scripts/CadRender.ps1) 提供可 dot-source 的函数——`Get-CadDxfRenderData`（解析 + 审计：段配对、EOF、实体可解析性，返回 `entityCounts`/`layerCounts`/`extents`/`version`/`encoding`）与 `Invoke-CadDxfPreviewRender`（固定页幅渲染）；CLI 只做参数与报告。支持 11 种实体：LINE / LWPOLYLINE / CIRCLE（拟合 65 点折线）/ ARC / ELLIPSE / SPLINE / TEXT / MTEXT / POINT / SOLID / DIMENSION（线性+半径）。PDF 端用 14 个 PDF 基础字体——**不含中文**，文字含非 Latin-1 字符时 PNG 照常渲染、PDF 里替换为 `?` 并写 warning；要中文 PDF 走 `Invoke-CadPlot.ps1` 的 CAD 打印通道。
+
+与 `Invoke-CadPlot.ps1` 的分工：要**精确、走 CAD 打印引擎**的 PDF 用 Plot（开 accoreconsole，约 4 秒）；要**快速看一眼、验证结构**用 Preview（零进程、毫秒级）。Preview 的页幅是画布尺寸，实体超出画布时按边界收进并记 warning，不是 CAD 的打印比例概念。
+
+## spec 多视图（一份 spec 出多张图）
+
+```json
+{
+  "name": "bracket",
+  "views": [
+    { "id": "front", "name": "主视图" },
+    { "id": "top",    "name": "俯视图" }
+  ],
+  "entities": [
+    { "type": "circle", "c": [0,0], "r": 10, "view_id": "front" },
+    { "type": "rect",   "p1": [0,0], "p2": [30,20] },
+    { "type": "point",  "at": [0,0] }
+  ],
+  "save": { "dwg": "bracket.dwg", "dxf": true }
+}
+```
+
+顶层加 `views[]`（每项必有 `id`，可选 `name`）即进入多视图模式：`Invoke-CadDraw` 先过 `Test-CadSpec`（新增校验：视图 id 唯一、实体 `view_id` 必须引用已知视图、`constraints.required_view_ids` 必须都存在；`entities` 空但 `views` 非空放行），然后按 `Get-CadSpecViewSpecs` 把 spec 拆成每视图一份子 spec——`view_id` 指向某视图的实体只进那一视图，**没有 `view_id` 的实体进所有视图**（共享实体），`save` 逐视图克隆且文件名前插 `<vid>-`（上例出 `front-bracket.dwg` / `top-bracket.dwg`）。子 spec 逐视图独立出图、独立 manifest。
+
+无 `views[]` 的 spec 行为完全不变。聚合报告带 `multiView: true` 与 `views[]`（每视图 `{id, status, disposition, entityCount, artifacts, manifest}`），顶层 `status`/`disposition` 取所有视图的最差档，`entityCount` 求和，视图级 warning 前缀 `[视图 <id>]`。单视图视图校验失败时该视图 `blocked`，顶层 `blocked`、exit 4，其余视图照常执行——**一个视图坏不拖累别的视图，但顶层结论如实反映**。
+
+
 
 ```powershell
 & "<skill>\scripts\Test-CadSpec.ps1" -SpecFile "drawing.json" -AsJson
 ```
 
-在启动 accoreconsole **之前**就把「注定失败」的 spec 拦下来。会抓：负半径、`rect` 宽或高为 0（RECTANG 会退化成一条线）、坐标超出 ±10⁷（多半是单位或小数点写错）、`polyline` 只有 1 个点、点是平铺数字数组、重复 `id`、重复图层、`constraints` 冲突（`maxEntities` 等）。**合法的 warning 不会挡路**：未声明图层（编译器会补建）、缺 `units`、非法 `units`、`dxfVersion` 非法值都只记 warning 并给出回落值。
+在启动 accoreconsole **之前**就把「注定失败」的 spec 拦下来。会抓：负半径、`rect` 宽或高为 0（RECTANG 会退化成一条线）、坐标超出 ±10⁷（多半是单位或小数点写错）、`polyline` 只有 1 个点、点是平铺数字数组、重复 `id`、重复图层、`constraints` 冲突（`maxEntities` 等）、多视图 spec 的 `views[]`/`view_id`/`required_view_ids` 引用错误。**合法的 warning 不会挡路**：未声明图层（编译器会补建）、缺 `units`、非法 `units`、`dxfVersion` 非法值都只记 warning 并给出回落值。
 
 ## 出图修复层
 
@@ -363,7 +399,7 @@ ProgID 解析顺序：`-ComProgId` → `CAD_COM_PROGID` → 配置 → `AutoCAD.
 | 用户想看什么 | 命令 | 验收重点 |
 |---|---|---|
 | 真机能不能画、产物对不对 | `run-test.ps1 -Test all` | 13 个实体全部落盘、块定义与块插入都成立、DWG/DXF/PDF 三结构校验通过、DXF 回读实体数与 JSON 声明交叉核对、中文未乱码、退出码 0、无残留进程、五态结论优先级、manifest 自比对与差异检出、PDF 矢量路径转 DXF 落在 MediaBox 内（**65 项**） |
-| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units、位图矢量化管线八函数与 Y 轴翻转（**265 项**） |
+| 逻辑对不对（完全不装 AutoCAD） | `run-unit-test.ps1` | 路径解析、GBK 写盘、JSON 编译、图层颜色回落、块构建器写法、DXF 解析（含 BOM 与 UTF-8/GBK 双解码）、PDF/DWG 结构校验、进程登记表六种拒绝条件、证据分级与五态结论、清单复现、单位与必需图层三分类、出图前预检、编译器接入 units、位图矢量化管线八函数与 Y 轴翻转（**314 项**） |
 | 出错时判断准不准 | `run-scenario-test.ps1` | 假 accoreconsole 制造九种「看起来成功」的假象，要求脚本自己戳破（mock **11** / offline **15** / real **3**） |
 
 ```powershell

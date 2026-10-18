@@ -857,9 +857,73 @@ function Test-CadSpecStrict {
 
     # ── entities ──
     $entities = @(Get-CheckField $Spec 'entities' @())
-    if ($entities.Count -eq 0) {
+    # 多视图 spec：views[] 非空时顶层 entities 允许为空（每视图的实体在
+    # views[i].entities 或共享实体里，拆分后逐视图再查）
+    $views = @(Get-CheckField $Spec 'views' @())
+    if ($entities.Count -eq 0 -and $views.Count -eq 0) {
         $errors.Add('entities 是空的，没有可画的东西')
     }
+
+    # ── views（多视图）──
+    $viewIds = @{}
+    $vi = 0
+    foreach ($vw in $views) {
+        if ($null -eq $vw) { $errors.Add("views[$vi] 是 null"); $vi++; continue }
+        $vid = ([string](Get-CheckField $vw 'id' '')).Trim()
+        if (-not $vid) {
+            $errors.Add("views[$vi] 缺少 id")
+        } elseif ($viewIds.ContainsKey($vid.ToLowerInvariant())) {
+            $errors.Add("视图 id '$vid' 重复（views[$($viewIds[$vid.ToLowerInvariant()])] 与 views[$vi]）")
+        } else {
+            $viewIds[$vid.ToLowerInvariant()] = $vi
+        }
+        # 视图内实体也要过结构检查（拆分前就地查一遍，报错带上视图编号）
+        $vent = @(Get-CheckField $vw 'entities' @())
+        $vei = 0
+        foreach ($ve in $vent) {
+            if ($null -eq $ve) { $errors.Add("views[$vi].entities[$vei] 是 null"); $vei++; continue }
+            $r = Test-CadSpecEntity -Entity $ve -Tag "views[$vi]($vid).entities[$vei]"
+            foreach ($e in $r.errors) { $errors.Add($e) }
+            foreach ($w in $r.warnings) { $warnings.Add($w) }
+            $vei++
+        }
+        # 视图内实体引用的图层：同样只警告自动补建
+        foreach ($ve in $vent) {
+            if ($null -eq $ve) { continue }
+            $ly = [string](Get-CheckField $ve 'layer' '')
+            if ($ly.Trim() -and -not $layerNames.ContainsKey($ly.ToLowerInvariant())) {
+                if (-not $autoLayers.ContainsKey($ly.ToLowerInvariant())) { $autoLayers[$ly.ToLowerInvariant()] = $ly }
+            }
+        }
+        $vi++
+    }
+
+    # ── 实体 view_id 必须引用已知视图 ──
+    if ($viewIds.Count -gt 0) {
+        $ei = 0
+        foreach ($ent in $entities) {
+            if ($null -ne $ent) {
+                $vref = ([string](Get-CheckField $ent 'view_id' '')).Trim()
+                if ($vref -and -not $viewIds.ContainsKey($vref.ToLowerInvariant())) {
+                    $errors.Add("entities[$ei] 的 view_id='$vref' 没有对应的 views[] 条目")
+                }
+            }
+            $ei++
+        }
+    }
+
+    # ── constraints.required_view_ids ──
+    $conRaw = Get-CheckField $Spec 'constraints'
+    if ($null -ne $conRaw) {
+        $reqViews = @(Get-CheckField $conRaw 'required_view_ids' @())
+        foreach ($rv in $reqViews) {
+            $rkey = ([string]$rv).Trim().ToLowerInvariant()
+            if ($rkey -and -not $viewIds.ContainsKey($rkey)) {
+                $errors.Add("constraints.required_view_ids 里的视图 '$rv' 没有在 views[] 里定义")
+            }
+        }
+    }
+
 
     # ── 图层 ──
     $layers = @(Get-CheckField $Spec 'layers' @())
@@ -992,6 +1056,7 @@ function Test-CadSpecStrict {
         entityCount    = $entities.Count
         blockCount     = $blocks.Count
         layerCount     = $layers.Count
+        viewCount      = $views.Count
         declaredLayers = @($layerNames.Keys)
         autoLayers     = @($autoLayers.Values)
         units          = $unitName

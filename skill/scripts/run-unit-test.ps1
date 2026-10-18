@@ -34,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CadImage.ps1')
 . (Join-Path $PSScriptRoot 'CadPdf.ps1')
 . (Join-Path $PSScriptRoot 'CadVectorize.ps1')
+. (Join-Path $PSScriptRoot 'CadRender.ps1')
 
 $scriptRoot = $PSScriptRoot
 $work = [IO.Path]::GetFullPath($WorkDirectory)
@@ -1141,6 +1142,199 @@ Check 'com-paperspace: ConvertTo-CadComPoint 一元逗号' ($comTxt -match 'retu
 
 # 退出姿势
 Check 'com-paperspace: finally 轮询进程退出' ($comTxt -match 'HasExited|Stop-Process') 'Quit 后 3s 还剩 1 个属退出中，须轮询而非立即报失败'
+
+
+# ══════════════════════════════════════════════════════════════════
+Section '24. 多视图 spec：校验 / 拆分 / 绘制包装'
+# ══════════════════════════════════════════════════════════════════
+
+# 24.1 校验：entities 空 + views 非空 → 允许
+$mvSpec = [pscustomobject]@{
+    name  = 'mv'
+    units = 'mm'
+    views = @(
+        [pscustomobject]@{ id = 'front'; entities = @(@{ type = 'circle'; c = @(0, 0); r = 10 }) },
+        [pscustomobject]@{ id = 'top';   entities = @(@{ type = 'rect'; p1 = @(0, 0); p2 = @(20, 10) }) }
+    )
+    entities = @(@{ type = 'point'; at = @(5, 5) })
+}
+$mvCheck = Test-CadSpecStrict -Spec $mvSpec
+Check '多视图：entities 空但 views 非空 → 通过' ($mvCheck.ok) ($mvCheck.errors -join ' | ')
+Check '多视图：stats 记 viewCount=2' ($mvCheck.stats.viewCount -eq 2) "viewCount=$($mvCheck.stats.viewCount)"
+
+# 24.2 校验：view_id 引用未知视图 → 报错
+$mvGhost = [pscustomobject]@{
+    name     = 'mv'
+    units    = 'mm'
+    views    = @([pscustomobject]@{ id = 'front'; entities = @() })
+    entities = @(@{ type = 'circle'; c = @(0, 0); r = 10; view_id = 'ghost' })
+}
+$mvGhostR = Test-CadSpecStrict -Spec $mvGhost
+Check '多视图：view_id 引用未知视图 → 报错' (-not $mvGhostR.ok) ($mvGhostR.errors -join ' | ')
+
+# 24.3 校验：views id 重复 → 报错
+$mvDup = [pscustomobject]@{
+    name     = 'mv'
+    units    = 'mm'
+    views    = @([pscustomobject]@{ id = 'a'; entities = @() }, [pscustomobject]@{ id = 'A'; entities = @() })
+    entities = @(@{ type = 'point'; at = @(0, 0) })
+}
+$mvDupR = Test-CadSpecStrict -Spec $mvDup
+Check '多视图：视图 id 重复（不区分大小写）→ 报错' (-not $mvDupR.ok) ($mvDupR.errors -join ' | ')
+
+# 24.4 校验：required_view_ids 引用未知视图 → 报错
+$mvReq = [pscustomobject]@{
+    name        = 'mv'
+    units       = 'mm'
+    views       = @([pscustomobject]@{ id = 'front'; entities = @() })
+    entities    = @(@{ type = 'point'; at = @(0, 0) })
+    constraints = [pscustomobject]@{ required_view_ids = @('top') }
+}
+$mvReqR = Test-CadSpecStrict -Spec $mvReq
+Check '多视图：required_view_ids 引用未知视图 → 报错' (-not $mvReqR.ok) ($mvReqR.errors -join ' | ')
+
+# 24.5 校验：entities 空 + views 也空 → 仍报错（原行为保留）
+$mvNone = [pscustomobject]@{ name = 'mv'; units = 'mm' }
+$mvNoneR = Test-CadSpecStrict -Spec $mvNone
+Check '多视图：entities 与 views 全空 → 仍报错' (-not $mvNoneR.ok) ($mvNoneR.errors -join ' | ')
+
+# 24.6 校验：视图内实体缺字段 → 报错带 views[i] 定位
+$mvBadEnt = [pscustomobject]@{
+    name  = 'mv'
+    units = 'mm'
+    views = @([pscustomobject]@{ id = 'front'; entities = @(@{ type = 'circle' }) })
+    entities = @(@{ type = 'point'; at = @(0, 0) })
+}
+$mvBadEntR = Test-CadSpecStrict -Spec $mvBadEnt
+Check '多视图：视图内实体缺字段 → 报错带 views[i] 定位' ((-not $mvBadEntR.ok) -and (($mvBadEntR.errors -join ' ') -match 'views\[0\]')) ($mvBadEntR.errors -join ' | ')
+
+# 24.7 拆分：Get-CadSpecViewSpecs
+$partSpec = [pscustomobject]@{
+    name  = 'part'
+    units = 'mm'
+    views = @(
+        [pscustomobject]@{ id = 'front'; entities = @(@{ type = 'circle'; c = @(0, 0); r = 50 }) },
+        [pscustomobject]@{ id = 'top' }
+    )
+    entities = @(@{ type = 'line'; p1 = @(0, 0); p2 = @(10, 0); view_id = 'front' }, @{ type = 'point'; at = @(2, 2) })
+    save = [pscustomobject]@{ dwg = 'out\part.dwg'; dxf = $true }
+}
+$frontSub = Get-CadSpecViewSpecs -Spec $partSpec | Where-Object { $_.name -eq 'part-front' }
+$topSub = Get-CadSpecViewSpecs -Spec $partSpec | Where-Object { $_.name -eq 'part-top' }
+Check '拆分：views[] 生成 front/top 两个子 spec' ($null -ne $frontSub -and $null -ne $topSub) ''
+Check '拆分：front 子 spec 含视图实体 + view_id 实体 + 共享实体 = 3 个' ($frontSub.entities.Count -eq 3) "ents=$($frontSub.entities.Count)"
+Check '拆分：top 子 spec 只含共享实体 = 1 个' ($topSub.entities.Count -eq 1) "ents=$($topSub.entities.Count)"
+Check '拆分：save 文件名前插视图 id' ($frontSub.save.dwg -eq 'out\front-part.dwg' -and $topSub.save.dwg -eq 'out\top-part.dwg') "front=$($frontSub.save.dwg) top=$($topSub.save.dwg)"
+
+# 24.8 静态断言：包装函数与聚合逻辑
+$drawTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'Invoke-CadDraw.ps1') -Raw
+Check 'Invoke-CadDraw.ps1 有单视图函数 Invoke-CadDrawSingle' ($drawTxt -match 'function Invoke-CadDrawSingle') ''
+Check 'Invoke-CadDraw.ps1 有多视图薄包装 function Invoke-CadDraw' ($drawTxt -match '(?m)^function Invoke-CadDraw \{') ''
+Check '多视图包装按最差状态聚合' ($drawTxt -match 'Get-CadSpecViewSpecs') ''
+Check '多视图报告带 multiView 与 views[] 字段' ($drawTxt -match 'multiView' -and $drawTxt -match 'views\s*=') ''
+Check 'spec 编译器含 Get-CadSpecViewSpecs 函数' ((Get-Content -LiteralPath (Join-Path $scriptRoot 'CadCompiler.ps1') -Raw) -match 'function Get-CadSpecViewSpecs') ''
+Check 'spec 校验含多视图 views 段' ((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'CadSpecCheck.ps1') -Raw) -match 'views（多视图）') ''
+
+
+# ══════════════════════════════════════════════════════════════════
+Section '25. DXF 预览渲染：CadRender / Invoke-CadRenderPreview'
+# ══════════════════════════════════════════════════════════════════
+
+# 25.1 Get-CadDxfRenderData：合成 DXF → 实体/图层计数
+$dxfPath = Join-Path $work 'render-sample.dxf'
+@'
+0
+SECTION
+2
+HEADER
+9
+$ACADVER
+1
+AC1032
+0
+ENDSEC
+0
+SECTION
+2
+ENTITIES
+0
+CIRCLE
+8
+GEO
+10
+0.0
+20
+0.0
+40
+10.0
+0
+LINE
+8
+GEO
+10
+0.0
+20
+0.0
+11
+5.0
+21
+5.0
+0
+TEXT
+8
+TXT
+10
+1.0
+20
+1.0
+40
+2.5
+1
+hello
+0
+ENDSEC
+0
+EOF
+'@ | Set-Content -LiteralPath $dxfPath -Encoding UTF8
+
+$rd = Get-CadDxfRenderData -Path $dxfPath
+Check '渲染数据：合成 DXF 校验通过' ($rd.valid) "reason=$($rd.reason)"
+Check '渲染数据：数出 3 个实体' ($rd.entityTotal -eq 3) "total=$($rd.entityTotal)"
+Check '渲染数据：图元 kind 含 polyline/line/text' (($rd.entities | ForEach-Object { $_.kind }) -contains 'polyline' -and ($rd.entities | ForEach-Object { $_.kind }) -contains 'text') ''
+Check '渲染数据：entityCounts 分型计数' ($rd.entityCounts['CIRCLE'] -eq 1 -and $rd.entityCounts['LINE'] -eq 1 -and $rd.entityCounts['TEXT'] -eq 1) "counts=$($rd.entityCounts | ConvertTo-Json -Compress)"
+Check '渲染数据：layerCounts 分层计数' ($rd.layerCounts['GEO'] -eq 2 -and $rd.layerCounts['TXT'] -eq 1) "layers=$($rd.layerCounts | ConvertTo-Json -Compress)"
+
+# 25.2 无效 DXF → valid=false
+$badDxf = Join-Path $work 'bad.dxf'
+'garbage' | Set-Content -LiteralPath $badDxf -Encoding UTF8
+$rdBad = Get-CadDxfRenderData -Path $badDxf
+Check '渲染数据：垃圾文件判无效' (-not $rdBad.valid) "reason=$($rdBad.reason)"
+
+# 25.3 静态断言：CadRender.ps1 铁律
+$renderTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'CadRender.ps1') -Raw
+Check 'CadRender: 工具版本号 Invoke-CadRenderPreview/1.0' ($renderTxt -match 'Invoke-CadRenderPreview/1\.0') ''
+Check 'CadRender: 页幅表含 A4/A3/A2/A1' ($renderTxt -match "'A4'" -and $renderTxt -match "'A3'" -and $renderTxt -match "'A2'" -and $renderTxt -match "'A1'") ''
+Check 'CadRender: A3 = 420x297' ($renderTxt -match '420' -and $renderTxt -match '297') ''
+Check 'CadRender: 默认 dpi=300' ($renderTxt -match 'dpi.*300|300.*dpi' -or $renderTxt -match '\$Dpi\s*=\s*300') ''
+Check 'CadRender: 图元覆盖 arc/circle/ellipse/line/lwpolyline/mtext/point/solid/spline/text/dimension' ($renderTxt -match "'ARC'" -and $renderTxt -match "'ELLIPSE'" -and $renderTxt -match "'SOLID'" -and $renderTxt -match "'DIMENSION'") ''
+Check 'CadRender: 输出 PNG+PDF 两类产物' ($renderTxt -match "'png'" -and $renderTxt -match "'pdf'") ''
+Check 'CadRender: warnings 含中文回退提示（14 基础字体不含中文）' ($renderTxt -match 'Latin-1') ''
+
+# 25.4 静态断言：CLI 包装
+$cliTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'Invoke-CadRenderPreview.ps1') -Raw
+Check 'Invoke-CadRenderPreview: ValidateSet 含 A4/A3/A2/A1' ($cliTxt -match "ValidateSet\('A4', 'A3', 'A2', 'A1'\)") ''
+Check 'Invoke-CadRenderPreview: report 带 tool 版本' ($cliTxt -match 'Invoke-CadRenderPreview/1\.0') ''
+Check 'Invoke-CadRenderPreview: dot-source CadRender.ps1' ($cliTxt -like "*Join-Path `$scriptDir 'CadRender.ps1'*") ''
+
+# 25.5 BOM：新增两个脚本必须带 UTF-8 BOM（PS5.1 中文兼容）
+$renderBom = $false
+$rb = [IO.File]::ReadAllBytes((Join-Path $scriptRoot 'CadRender.ps1'))
+if ($rb.Length -ge 3 -and $rb[0] -eq 0xEF -and $rb[1] -eq 0xBB -and $rb[2] -eq 0xBF) { $renderBom = $true }
+Check 'CadRender.ps1 带 UTF-8 BOM' $renderBom ''
+$cliBom = $false
+$cb = [IO.File]::ReadAllBytes((Join-Path $scriptRoot 'Invoke-CadRenderPreview.ps1'))
+if ($cb.Length -ge 3 -and $cb[0] -eq 0xEF -and $cb[1] -eq 0xBB -and $cb[2] -eq 0xBF) { $cliBom = $true }
+Check 'Invoke-CadRenderPreview.ps1 带 UTF-8 BOM' $cliBom ''
 
 
 # ══════════════════════════════════════════════════════════════════

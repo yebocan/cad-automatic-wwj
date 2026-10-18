@@ -27,12 +27,54 @@
 | `units` | string | 否 | **会真的生效**：合法值会生成 `(cadunits <code>)` 在出图前 `setvar "INSUNITS"`。合法值见下表；不写或写错只记 warning 不挡路 |
 | `layers` | array | 否 | 图层声明。**实体引用了但没声明的图层会自动补建**（颜色 7）并记 warning |
 | `blocks` | array | 否 | 块定义 |
-| `entities` | array | **是** | 实体列表，按数组顺序依次创建 |
-| `save` | object | 否 | 存盘/导出。不写就只画不存（适合 `-DryRun` 之外的快速验证） |
+| `views` | array | 否 | **多视图模式开关**：非空即进入多视图模式，一份 spec 拆成多张图。结构见下方「多视图 `views[]`」 |
+| `entities` | array | * | 实体列表，按数组顺序依次创建。**多视图模式下可以省**（共享实体为空时），前提是至少有一个视图带了本地实体；两者都空仍然报错 |
+| `save` | object | 否 | 存盘/导出。不写就只画不存（适合 `-DryRun` 之外的快速验证）。多视图模式下按视图克隆，文件名前插 `<vid>-` |
 | `constraints` | object | 否 | 出图前的约束校验，见第 8 节 |
 | `zoom` | bool | 否 | 默认 `true`。画完执行 `c:ZOOMEXT` |
 
 `entities` 缺失或为空数组都不会崩，只是画出空图（`entityCount=0`）。
+
+### 多视图 `views[]`
+
+```json
+{
+  "name": "bracket",
+  "views": [
+    { "id": "front", "name": "主视图" },
+    { "id": "top",   "name": "俯视图" }
+  ],
+  "entities": [
+    { "type": "circle", "c": [0,0], "r": 10, "view_id": "front" },
+    { "type": "rect",   "p1": [0,0], "p2": [30,20] },
+    { "type": "point",  "at": [0,0] }
+  ],
+  "save": { "dwg": "bracket.dwg", "dxf": true }
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `views[].id` | string | **必填** | 视图标识。**不区分大小写地查重**——`front` 与 `FRONT` 同时出现报错 |
+| `views[].name` | string | 否 | 显示名，进报告与 manifest |
+
+拆分规则（`Get-CadSpecViewSpecs`）：
+
+- `view_id` 指向视图 X 的实体 → 只进 X 的子 spec；
+- **无 `view_id` 的实体 → 进所有视图**（共享实体）；
+- 全局 `units` / `layers` / `blocks` / `zoom` / `calibration` 照搬进每个子 spec；
+- `save` 逐视图克隆，文件名前插 `<vid>-`（`bracket.dwg` → `front-bracket.dwg` / `top-bracket.dwg`；绝对路径保留目录只改文件名）；
+- 子 spec `name` = `<原名>-<vid>`。
+
+校验规则（`Test-CadSpec`，出错即 `blocked`）：
+
+1. `views[].id` 缺失或重复 → 报错（错误信息带 `views[i]` 定位）；
+2. 实体 `view_id` 引用了不存在的视图 → 报错；
+3. `constraints.required_view_ids` 引用了不存在的视图 → 报错；
+4. `entities` 与 `views` **都**为空 → 报错（原规则不变）；`entities` 空但 `views` 非空 → 放行；
+5. 视图内实体本身字段错误 → 报错带 `views[i](vid).entities[j]` 定位。
+
+执行（`Invoke-CadDraw`）：无 `views[]` 行为与以前完全一样；有 `views[]` 时逐视图出图、逐视图独立 manifest，聚合报告顶层 `status`/`disposition` 取所有视图的**最差档**，`entityCount` 求和，视图级 warning 前缀 `[视图 <id>]`，并带 `multiView: true` 与 `views[]` 明细（每视图 `{id, status, disposition, entityCount, artifacts, manifest, report}`）。单个视图 `blocked`（如校验错误）不拖累其他视图执行，但顶层结论如实反映（exit 4）。
 
 ### `units` 合法值
 
@@ -77,6 +119,8 @@
 | `type` | string | **必填** | 见下表 |
 | `layer` | string | 顶层默认图层（`0`） | 非 `0`/非空时切 `CLAYER` |
 | `comment` | string | — | 只回显到 LISP 注释，便于调试 |
+| `id` | string | — | 实体唯一标识。**多视图模式下必须全局唯一**，任何视图重复都报错 |
+| `view_id` | string | — | **多视图模式专用**：指向 `views[]` 里某项的 `id`。指向的实体只画进那个视图；**不写 `view_id` 的实体是共享实体，画进所有视图** |
 
 点（point）的写法有三种，处处通用：
 

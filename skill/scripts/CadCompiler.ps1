@@ -731,7 +731,6 @@ function Compile-CadSpec {
 
     [void]$sb.AppendLine('(princ "\n@@DONE@@")')
     [void]$sb.AppendLine('(princ)')
-
     return [pscustomobject]@{
         lisp        = $sb.ToString()
         entityCount = $compiled.Count
@@ -739,4 +738,101 @@ function Compile-CadSpec {
         entities    = $compiled.ToArray()
         warnings    = $warnings.ToArray()
     }
+}
+# ═══════════════════════════════════════════════════════════════════
+# spec 多视图（views[]）：把一份 spec 拆成若干张可独立保存的视图
+# ═══════════════════════════════════════════════════════════════════
+# 结构约定（与对方 image-redraw-spec 对齐，证据四级沿用我方体系）：
+#   spec.views = [ { id/view/name, entities?: [entity...] } ... ]
+#   实体可选 view_id 指向 views[].id；带 view_id 的实体**只**属于那个视图，
+#   顶层 entities 不再重复它（避免一次画两遍）。
+#   constraints.required_view_ids = ['v1','v2'] 声明哪些视图必须产出。
+#
+# 拆分规则（Get-CadSpecViewSpecs 返回的每个子 spec）：
+#   1. 全局配置照搬：units / layers / blocks / zoom / calibration。
+#   2. 该视图实体 = views[i].entities + 顶层 entities 里 view_id 匹配的。
+#   3. view_id='' 或不写的顶层实体归所有视图共享。
+#   4. save 按视图重写：视图有 save 用视图的；否则克隆顶层 save，
+#      dwg/dxf/pdf 文件名前插 '<视图id>-'（已有路径保留目录只换文件名）。
+#   5. 图纸名 = drawing + '-' + 视图 id。
+function Get-CadSpecViewSpecs {
+    param([Parameter(Mandatory)]$Spec)
+
+    $views = Get-CadField $Spec 'views'
+    if (-not $views) { return @() }
+
+    # 顶层各段
+    $topEntities = @(Get-CadField $Spec 'entities' @())
+    $layers = Get-CadField $Spec 'layers'
+    $blocks = Get-CadField $Spec 'blocks'
+    $units = Get-CadField $Spec 'units'
+    $zoom = Get-CadField $Spec 'zoom'
+    $calib = Get-CadField $Spec 'calibration'
+    $save = Get-CadField $Spec 'save'
+    $drawName = [string](Get-CadField $Spec 'name' 'drawing')
+    if (-not $drawName) { $drawName = 'drawing' }
+
+    # 顶层实体按 view_id 分桶：'' = 共享
+    $shared = New-Object System.Collections.Generic.List[object]
+    $byView = @{}
+    $viewIds = @()
+    foreach ($v in @($views)) {
+        $vid = [string](Get-CadField $v 'id' '')
+        if ($vid) { $viewIds += $vid }
+    }
+    foreach ($ent in $topEntities) {
+        if ($null -eq $ent) { continue }
+        $vid = ([string](Get-CadField $ent 'view_id' '')).Trim()
+        if ($vid) {
+            if (-not $byView.ContainsKey($vid)) { $byView[$vid] = New-Object System.Collections.Generic.List[object] }
+            $byView[$vid].Add($ent)
+        } else {
+            $shared.Add($ent)
+        }
+    }
+
+    $out = New-Object System.Collections.Generic.List[object]
+    $vi = 0
+    foreach ($v in @($views)) {
+        $vid = ([string](Get-CadField $v 'id' '')).Trim()
+        $vName = ([string](Get-CadField $v 'name' $vid)).Trim()
+        if (-not $vid) { $vi++; continue }
+
+        # 视图实体：视图自带 + 顶层 view_id 匹配 + 共享
+        $ents = New-Object System.Collections.Generic.List[object]
+        foreach ($e in @(Get-CadField $v 'entities' @())) { if ($null -ne $e) { $ents.Add($e) } }
+        if ($byView.ContainsKey($vid)) { foreach ($e in $byView[$vid]) { $ents.Add($e) } }
+        foreach ($e in $shared) { $ents.Add($e) }
+
+        # 克隆顶层 save，文件名前插 '<vid>-'
+        $vSave = $null
+        $vSaveRaw = Get-CadField $v 'save'
+        if ($vSaveRaw) {
+            $vSave = $vSaveRaw
+        } elseif ($save) {
+            $vSave = $save.PSObject.Copy()
+            foreach ($key in @('dwg', 'dxf', 'pdf')) {
+                $p = Get-CadField $vSave $key
+                if ($p -is [string] -and $p -and ($p -notmatch '^[A-Za-z]:') -and ($p -notmatch '^\\\\')) {
+                    $dir = Split-Path -Parent $p
+                    $leaf = Split-Path -Leaf $p
+                    $vSave | Add-Member -NotePropertyName $key -NotePropertyValue $(if ($dir) { Join-Path $dir "$vid-$leaf" } else { "$vid-$leaf" }) -Force
+                }
+            }
+        }
+
+        $sub = [ordered]@{}
+        if ($units) { $sub['units'] = $units }
+        if ($layers) { $sub['layers'] = $layers }
+        if ($blocks) { $sub['blocks'] = $blocks }
+        if ($calib) { $sub['calibration'] = $calib }
+        $sub['name'] = if ($vName -and $vName -ne $vid) { "$drawName-$vName" } else { "$drawName-$vid" }
+        $sub['entities'] = $ents.ToArray()
+        if ($vSave) { $sub['save'] = $vSave }
+        if ($null -ne $zoom) { $sub['zoom'] = $zoom }
+        $out.Add([pscustomobject]$sub)
+        $vi++
+    }
+
+    return $out.ToArray()
 }
