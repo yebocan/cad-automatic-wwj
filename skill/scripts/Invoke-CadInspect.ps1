@@ -137,6 +137,16 @@ try {
         }
         '.dwg' {
             $report.format = 'dwg'
+            # ★ 先直接读 DWG 文件头拿真实版本，再去转换 ★
+            #   原来这里只取 $info.version（转换后 DXF 的 $ACADVER），而
+            #   Convert-CadDwgToDxf 固定按 "2018" 导出 DXF —— 于是任何 DWG
+            #   体检出来都报 2018，把 2013 的文件误报成 2018。
+            #   版本是「文件自己说自己是哪一版」，必须以文件头为准。
+            $dwgCheck = Test-CadDwgFile -Path $full
+            if (-not $dwgCheck.valid) {
+                $warnings.Add("DWG 结构校验未通过: $($dwgCheck.reason)")
+            }
+            $report.version = $dwgCheck.version
             $conv = Convert-CadDwgToDxf -DwgPath $full -TimeoutSeconds $TimeoutSeconds
             $dxfPath = $conv.dxf
             $tempDir = $conv.work
@@ -155,7 +165,10 @@ try {
     $report.extents     = $info.extents
     $report.blockCount  = $info.blockCount
     $report.sections    = $info.sections
-    $report.version     = $info.version
+    # ★ 只有 DXF 输入才用 $ACADVER ★
+    #   DWG 输入时 version 已经由文件头定死（见上面 .dwg 分支），
+    #   这里再用「转换后临时 DXF 的版本」覆盖，就又把 2013 报成 2018 了。
+    if ($ext -eq '.dxf') { $report.version = $info.version }
 
     if (-not $info.dxfValid) { $warnings.Add("DXF 校验未通过: $($info.reason)") }
     if ($info.malformedLines -gt 0) { $warnings.Add("DXF 有 $($info.malformedLines) 行不是合法的组码/值对") }
