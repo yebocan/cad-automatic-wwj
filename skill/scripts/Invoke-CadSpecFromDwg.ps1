@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Invoke-CadSpecFromDwg.ps1 — 从已有图纸反推 spec JSON 骨架。
 

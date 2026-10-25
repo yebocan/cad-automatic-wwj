@@ -1,4 +1,4 @@
-﻿---
+---
 name: cad-automatic-wwj
 description: 用本机 AutoCAD（accoreconsole 无界面命令行 / COM 自动化）从 JSON 描述生成真实 DWG 图纸并回读验证：画线圆弧多段线齿轮螺栓孔阵列、建图层、加标注填充块、导出 DXF（R12–2018）与 PDF、把 PDF 矢量路径转回 DXF、不开 CAD 把 DXF 渲染成 PNG/PDF 预览、spec 一份多视图拆分出多张图、预检图片能不能照抄、体检已有图纸、出问题时自动诊断修复。中文不乱码、产物经过结构校验而不只看文件存在，结论分五档、证据分四级、可出 manifest 复现比对。附集成自检 / 单元测试 / 场景测试三套套件。零 Python 依赖。
 ---

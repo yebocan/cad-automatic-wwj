@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Get-CadDwgSpecFingerprint.ps1 — 从一张已有图纸（DXF/DWG）提取「实体指纹」，
     输出结构化的 JSON 报告：实体统计、图层分布、块引用、文字与标注清单、几何锚点。

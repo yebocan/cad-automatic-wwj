@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Invoke-CadAnchorCompare.ps1 — 锚点配准比对（重建预览 ↔ 源图）。
 

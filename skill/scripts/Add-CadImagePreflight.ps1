@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Add-CadImagePreflight.ps1 — 图片进矢量重建前的质量预检。
 

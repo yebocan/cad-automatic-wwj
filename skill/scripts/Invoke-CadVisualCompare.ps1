@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Invoke-CadVisualCompare.ps1 — 出图结果与参照物做锚点级比对。
 

@@ -371,7 +371,15 @@ function Invoke-ScenarioScript {
     if ($budget -le 10) { throw "总预算不足，无法执行 $Script" }
 
     $argv = @('-NoProfile', '-File', $Script) + $Arguments + @('-TimeoutSeconds', $budget)
-    $raw = & pwsh @argv 2>&1 | Out-String
+    # 子进程用的 shell：优先 pwsh 7，没有就回落到当前宿主（Windows PowerShell 5.1 只有 powershell.exe）。
+    # 硬编码 pwsh 会在没装 PS7 的机器上直接把每个场景打成 exception。
+    $shell = (Get-Command pwsh -ErrorAction SilentlyContinue)
+    if ($shell) { $shellExe = $shell.Source }
+    else {
+        $shellExe = (Get-Process -Id $PID).Path
+        if (-not $shellExe) { $shellExe = 'powershell.exe' }
+    }
+    $raw = & $shellExe @argv 2>&1 | Out-String
     $obj = $null
     try { $obj = $raw | ConvertFrom-Json } catch { }
     return [pscustomobject]@{ raw = $raw; obj = $obj }
