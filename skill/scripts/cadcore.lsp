@@ -457,7 +457,21 @@
 
 ;; 线性（水平/垂直自动）标注：(c:DIMLIN x1 y1 x2 y2 tx ty)
 ;;   组码：10=尺寸线定义点 11=文字中点 70=0(旋转型) 13/14=两条尺寸界线原点
-(defun c:DIMLIN (x1 y1 x2 y2 tx ty / e)
+;;
+;;   ★ 50 组码（旋转角）必须按两点几何自动判定，绝不能写死 0 ★
+;;   原来这里固定 '(50 . 0)，于是「竖向标注」的尺寸线被强制水平，
+;;   AutoCAD 量出来的 42 组码（实际测量值）是两点在水平方向的投影差 ——
+;;   竖直边 0→120 实测得到 0.0，图上直接印出一个「0」。
+;;   这不是显示问题，是标注真实值就错了。
+;;   判据：两点水平跨度 >= 垂直跨度 → 水平标注(rot=0)；
+;;         否则 → 垂直标注(rot=pi/2)，此时量的是 y 投影差。
+(defun c:DIMLIN (x1 y1 x2 y2 tx ty / e rot dx dy)
+  (setq dx (abs (- x2 x1)))
+  (setq dy (abs (- y2 y1)))
+  (if (>= dx dy)
+    (setq rot 0.0)
+    (setq rot (/ pi 2.0))
+  )
   (setq e (entmake
     (list '(0 . "DIMENSION") '(100 . "AcDbEntity") (cons 8 (getvar "CLAYER"))
           '(100 . "AcDbDimension")
@@ -469,11 +483,12 @@
           '(100 . "AcDbAlignedDimension")
           (cons 13 (list x1 y1 0))
           (cons 14 (list x2 y2 0))
-          '(50 . 0)
+          (cons 50 rot)
           '(100 . "AcDbRotatedDimension"))))
   (if e
     (cadsay "DIMLIN" (strcat "p1=" (cadnum x1) "," (cadnum y1)
                              " p2=" (cadnum x2) "," (cadnum y2)
+                             " rot=" (cadnum (/ (* rot 180.0) pi))
                              " handle=" (cdr (assoc 5 (entget (entlast))))))
     (cadsay "DIMLIN" "FAILED-entmake-nil"))
   (princ)
@@ -515,24 +530,32 @@
 
 ;; 半径标注：(c:DIMRAD cx cy ex ey tx ty)
 ;;   70=4 表示半径型；15=圆/弧上的定义点（就是边缘点 ex,ey）；40=引线长度
-;;   注意：这里 cx cy 只用于证据输出，几何完全由 15 组码决定。
+;;
+;;   ★ 10 组码是「圆心」，不是文字点 ★
+;;   原来写成 (10 . 文字点)，AutoCAD 就把「文字点到圆周点的距离」当半径量：
+;;   圆心 100,60 / 半径 45 / 文字点 150,112 实测 42 组码 = 52.2398，
+;;   图上印出 R52.24 —— 差 7.24mm，装不上。
+;;   正确组码分工：
+;;     10 = 圆心 (cx,cy)      ← AcDbDimension 的定义点，半径标注里就是圆心
+;;     11 = 文字中点 (tx,ty)  ← 文字摆哪儿只由它决定
+;;     15 = 圆周上的点 (ex,ey)
 (defun c:DIMRAD (cx cy ex ey tx ty / e r)
   (setq r (distance (list cx cy) (list ex ey)))
   (setq e (entmake
     (list '(0 . "DIMENSION") '(100 . "AcDbEntity") (cons 8 (getvar "CLAYER"))
           '(100 . "AcDbDimension")
-          (cons 10 (list tx ty 0))
+          (cons 10 (list cx cy 0))
           (cons 11 (list tx ty 0))
           '(70 . 4)
           '(1 . "")
           (cons 3 (getvar "DIMSTYLE"))
           '(100 . "AcDbRadialDimension")
           (cons 15 (list ex ey 0))
-          '(40 . 0)
-          '(50 . 0))))
+          '(40 . 0))))
   (if e
     (cadsay "DIMRAD" (strcat "c=" (cadnum cx) "," (cadnum cy)
                              " r=" (cadnum r)
+                             " edge=" (cadnum ex) "," (cadnum ey)
                              " handle=" (cdr (assoc 5 (entget (entlast))))))
     (cadsay "DIMRAD" "FAILED-entmake-nil"))
   (princ)

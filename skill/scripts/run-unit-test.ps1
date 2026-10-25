@@ -561,6 +561,22 @@ foreach ($fn in @('c:DIMLIN', 'c:DIMALIGN', 'c:DIMRAD')) {
     Check "$fn 使用 entmake（不用 command）" ($seg -like '*(entmake*' -and $seg -notlike '*(command "_.DIM*') ''
 }
 
+# ── 标注测量值必须正确（这是 42 组码真值错，不是显示问题）──────────────
+# 1) c:DIMLIN 的 50 组码曾被写死 0：竖向标注量的是 x 投影 → 竖直边 0→120
+#    在图上印出「0」。必须按 dx/dy 自动判定 rot（水平 0 / 竖直 pi/2）。
+$dlIdx = $cadcoreTxt.IndexOf('(defun c:DIMLIN ')
+$dlSeg = if ($dlIdx -ge 0) { $cadcoreTxt.Substring($dlIdx, [Math]::Min(3000, $cadcoreTxt.Length - $dlIdx)) } else { '' }
+Check 'c:DIMLIN 按几何判定旋转角（不写死 50=0）' ($dlSeg -notlike "*(cons 50 0)*" -and $dlSeg -notlike "'(50 . 0)" -and $dlSeg -like '*(/ pi 2.0)*') "竖向标注曾被写成 0，42 组码实测 0.0 而非 120"
+Check 'c:DIMLIN 比较 dx/dy 决定方向' ($dlSeg -like '*(abs (- x2 x1))*' -and $dlSeg -like '*(abs (- y2 y1))*') ''
+
+# 2) c:DIMRAD 的 10 组码必须是圆心：写成文字点会让 42 组码 = |文字点-圆周点|，
+#    实测 圆心(100,60) r=45 文字点(150,112) 得到 52.2398，图上印 R52.24。
+$drIdx = $cadcoreTxt.IndexOf('(defun c:DIMRAD ')
+$drSeg = if ($drIdx -ge 0) { $cadcoreTxt.Substring($drIdx, [Math]::Min(3000, $cadcoreTxt.Length - $drIdx)) } else { '' }
+Check 'c:DIMRAD 的 10 组码是圆心（不是文字点）' ($drSeg -like '*(cons 10 (list cx cy 0))*') '10 组码写错会让半径量成 |文字点-圆周点|，实测 52.24 而非 45'
+Check 'c:DIMRAD 的 11 组码是文字中点' ($drSeg -like '*(cons 11 (list tx ty 0))*') ''
+Check 'c:DIMRAD 的 15 组码是圆周点' ($drSeg -like '*(cons 15 (list ex ey 0))*') ''
+
 # ── 块构建器：必须存在且不许直接开 -BLOCK 让实体自动入块 ─────────────
 # 这条是踩出来的：直觉写法 (command "_.-BLOCK" name pt) 之后紧跟画图命令，
 # -BLOCK 会把后面的坐标当"选择点"吃掉，冒出 *无效选择* 并卡到超时。
