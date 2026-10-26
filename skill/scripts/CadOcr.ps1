@@ -29,6 +29,13 @@
 #  一、可用性探测
 # ══════════════════════════════════════════════════════════════════
 
+# ★ 反射句柄缓存必须先声明 ★
+#   Set-StrictMode -Version Latest 下，读取「从未赋值过」的变量会直接抛
+#   「无法检索变量，因为尚未设置该变量」——注意这不是 $null 判断能救的，
+#   错误发生在读的那一刻，$null -ne $script:X 本身就炸。
+#   所以这里先显式置 $null，后面才敢用 `if ($null -ne ...)` 做缓存命中判断。
+$script:CadOcrAsTask = $null
+
 function Test-CadOcrAvailable {
     <#
       探测本机 OCR 能不能用。

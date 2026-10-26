@@ -35,6 +35,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CadPdf.ps1')
 . (Join-Path $PSScriptRoot 'CadVectorize.ps1')
 . (Join-Path $PSScriptRoot 'CadRender.ps1')
+. (Join-Path $PSScriptRoot 'CadOcr.ps1')
 
 $scriptRoot = $PSScriptRoot
 $work = [IO.Path]::GetFullPath($WorkDirectory)
@@ -1486,6 +1487,66 @@ $coreTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'cadcore.lsp') -Raw -
 $hasVFor2018 = ($coreTxt -notmatch '=\s*\(strcase v\)\s*"2018"')
 Check 'SAVEDXF：2018 不再抄近路（必须走 _V）' $hasVFor2018 ''
 Check 'SAVEDXF：仍保留 _V 分支' ($coreTxt -match '"_V"\s+v\s+p') ''
+
+# ══════════════════════════════════════════════════════════════════
+Section '28. OCR：可用性探测 + 降级路径'
+# ══════════════════════════════════════════════════════════════════
+# OCR 依赖本机 Windows 语言包，不能假设一定可用。这一节只测「不可用
+# 时会不会好好降级」和「可用时能不能真读出一行字」，不假设结果文本。
+
+Check 'CadOcr.ps1 存在' (Test-Path -LiteralPath (Join-Path $scriptRoot 'CadOcr.ps1')) ''
+Check 'CadOcr.ps1 带 UTF-8 BOM' `
+    (@([IO.File]::ReadAllBytes((Join-Path $scriptRoot 'CadOcr.ps1'))[0..2]) -join ',' -eq '239,187,191') ''
+
+# ★ 防回归：script 作用域缓存变量必须显式初始化 ★
+#   Set-StrictMode 下读未初始化变量直接抛「尚未设置该变量」，
+#   $null -ne $script:X 这种写法救不了（读的那一刻就炸了）。踩过。
+$ocrTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'CadOcr.ps1') -Raw -Encoding UTF8
+Check 'CadOcr：script 缓存变量显式初始化' `
+    ($ocrTxt -match '\$script:CadOcrAsTask\s*=\s*\$null') ''
+
+$ocrProbe = Test-CadOcrAvailable
+Check 'OCR 探测：返回 available 字段' ($null -ne $ocrProbe.available) "available=$($ocrProbe.available)"
+if ($ocrProbe.available) {
+    Write-Host ("       本机 OCR 可用，语言=$($ocrProbe.language)") -ForegroundColor DarkGray
+    # 造一张大字号图（40px，OCR 可靠区间），验证真能读出字
+    $ocrDir = Join-Path $work 'ocr'
+    New-Item -ItemType Directory -Path $ocrDir -Force | Out-Null
+    $ocrImg = Join-Path $ocrDir 'ocr-sample.png'
+    $ok = $true
+    try {
+        $bmp2 = New-Object System.Drawing.Bitmap 700, 160
+        $g2 = [System.Drawing.Graphics]::FromImage($bmp2)
+        $g2.Clear([System.Drawing.Color]::White)
+        $g2.TextRenderingHint = 'AntiAliasGridFit'
+        $f2 = New-Object System.Drawing.Font('Microsoft YaHei', 40.0, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $g2.DrawString('KM1 QF1', $f2, [System.Drawing.Brushes]::Black, 30.0, 50.0)
+        $g2.Dispose(); $bmp2.Save($ocrImg, [System.Drawing.Imaging.ImageFormat]::Png); $bmp2.Dispose()
+    } catch { $ok = $false }
+    if ($ok) {
+        $regions = @([pscustomobject]@{ id = 'T1'; x = 25; y = 45; w = 640; h = 70 })
+        $ocrRes = Invoke-CadOcrRegions -ImagePath $ocrImg -Regions $regions
+        Check 'OCR 识别：不抛异常且有结果' (@($ocrRes.results).Count -eq 1) "results=$(@($ocrRes.results).Count)"
+        $first = @($ocrRes.results)[0]
+        Check 'OCR 识别：ok=true 且 text 非空' `
+            ($first.ok -eq $true -and -not [string]::IsNullOrWhiteSpace($first.text)) `
+            ("text='" + $first.text + "'")
+        # OCR 引擎对 I/1 有通病，不校验精确文本，只校验「认出了 K/M/Q/F 这类字符」
+        Check 'OCR 识别：内容含可辨识字符' ($first.text -match '[A-Za-z]') ("text='" + $first.text + "'")
+    } else {
+        Check 'OCR 识别：能造测试图' $false 'System.Drawing 不可用'
+    }
+} else {
+    Write-Host ("       本机 OCR 不可用（$($ocrProbe.error)），只验证降级路径") -ForegroundColor DarkGray
+    # 降级：OCR 不可用时 Invoke-CadOcrRegions 必须返回 ok=false + error，
+    # 而不是抛异常（抛了会让整个 vectorize 失败，把「没装语言包」变成硬故障）
+    $regions = @([pscustomobject]@{ id = 'T1'; x = 0; y = 0; w = 10; h = 10 })
+    $dummyImg = Join-Path $work 'dummy.png'
+    if (Test-Path $ocrImg) { $dummyImg = $ocrImg }
+    $threw = $false
+    try { $r = Invoke-CadOcrRegions -ImagePath $dummyImg -Regions $regions } catch { $threw = $true }
+    Check 'OCR 降级：不可用时不抛异常' (-not $threw) ''
+}
 
 
 # ══════════════════════════════════════════════════════════════════
