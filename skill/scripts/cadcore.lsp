@@ -637,6 +637,52 @@
   (princ)
 )
 
+;; ══════════════════════════════════════════════════════════════════
+;;  模板底图相关
+;; ══════════════════════════════════════════════════════════════════
+
+;; 只保留指定图层：(c:BASELAYERS (list "GEO" "TEXT" "DIM"))
+;;
+;; 用途：模板里往往带着几十个用不上的图层（Defpoints、各种标注样式层、
+;; 别的项目留下的层），一份新图只需要其中几个。这里把不在清单里的图层
+;; 上的实体删掉、再把空图层 PURGE 掉。
+;;
+;; ★ 为什么必须先把实体删掉再 PURGE ★
+;;   PURGE 只删「空」图层；还有实体挂着的层删不掉，会静默留下。
+;;   先 ERASE 该层实体 → 层空了 → PURGE 才真的生效。
+;; ★ 为什么 0 层和当前层不能删 ★
+;;   PURGE 0 层会被拒绝；删当前层会让后续绘制报错。两者都跳过并留标记。
+(defun c:BASELAYERS (keep / tbl rec lay drop n dropped)
+  (setq tbl (tblnext "LAYER" T))
+  (setq drop '())
+  (while tbl
+    (setq lay (cdr (assoc 2 tbl)))
+    (if (and (/= lay "0")
+             (/= lay (getvar "CLAYER"))
+             (not (member lay keep)))
+      (setq drop (cons lay drop))
+    )
+    (setq tbl (tblnext "LAYER"))
+  )
+  (setq dropped 0)
+  (foreach lay drop
+    (c:DELLAYER lay)
+    (setq dropped (1+ dropped))
+    ;; PURGE 空图层。命令不认名字时只会提示一行就继续，不会挂住。
+    (cadcmd (list "_.PURGE" "_LA" lay "_N"))
+  )
+  (cadsay "BASELAYERS" (strcat "kept=" (itoa (length keep)) " purged=" (itoa dropped)))
+  (princ)
+)
+
+;; 模板实体统计：(c:BASEINFO)
+;;   模板模式下用来把「模板自带多少实体」和「新画了多少」分开报告。
+(defun c:BASEINFO ( / ss)
+  (setq ss (ssget "_X"))
+  (cadsay "BASEINFO" (strcat "entities=" (itoa (if ss (sslength ss) 0))))
+  (princ)
+)
+
 ;; 复制：(c:COPYLAST dx dy)
 (defun c:COPYLAST (dx dy / e)
   (setq e (entlast))
@@ -877,18 +923,21 @@
 ;;   2007 → AC1021
 ;;   2010 → AC1024
 ;;   2013 → AC1027  (125,759 字节)
-;;   2018 → AC1032  (默认，不切换)
+;;   2018 → AC1032
+;;
+;; ★ 别为 2018 抄近路（已踩过）★
+;;   曾经写成「2018 是当前格式，省掉 _V 两步直接 DXFOUT」——错。
+;;   本机 AutoCAD 2018 的 DXFOUT 默认输出格式是 **2013**（AC1027），
+;;   不是 2018。省掉 _V 的结果是：请求 2018、实得 AC1027，文件看着
+;;   没问题（能打开、实体齐全），只有比对文件头才看得出来。所以
+;;   2018 也必须走 _V 分支，一个特例都不留。
 (defun c:SAVEDXF (path ver prec / full v p)
   (setq full path
         v    (if (and ver (> (strlen ver) 0)) ver "2018")
         p    (if (and prec (> (strlen prec) 0)) prec "16")
   )
   (if (findfile full) (vl-file-delete full))
-  (if (= (strcase v) "2018")
-    ;; 2018 是当前格式，不需要走 _V 分支，少两步输入
-    (cadcmd (list "_.DXFOUT" full p))
-    (cadcmd (list "_.DXFOUT" full "_V" v p))
-  )
+  (cadcmd (list "_.DXFOUT" full "_V" v p))
   (if (findfile full)
     (cadsay "SAVEDXF" (strcat "ok=" full " ver=" v " size=" (itoa (vl-file-size full))))
     (cadsay "SAVEDXF" (strcat "FAILED=" full " ver=" v))

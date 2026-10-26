@@ -48,7 +48,19 @@ param(
     # 清单路径。留空则写到 <OutputDir>\manifest.json；给 '' 则不写清单
     [string]$Manifest,
     # 已有的清单文件，用来比对两次运行是否一致
-    [string]$CompareManifest
+    [string]$CompareManifest,
+    # ── 模板底图 ──
+    # 给一个已存在的 DWG，就在它上面接着画，而不是从空白图起画。
+    # 用途：图框/标题栏/图层/标注样式/线型都在模板里，只往里面填几何。
+    # 实现是 accoreconsole /i <base>，画完 SAVEAS 到 -Dwg 指定的路径；
+    # 原文件不动（先复制到工作目录再打开，避免 AutoCAD 锁住用户的原图）。
+    [string]$BaseDwg,
+    # 模板里的哪些图层要保留（默认全保留）。给值时会把模板里不在这份
+    # 清单上的图层 PURGE 掉 —— 只在模板塞了太多无关图层时才需要。
+    [string[]]$KeepBaseLayers,
+    # 保留模板里的实体（图框、标题栏）。默认 true。
+    # 设为 false 表示「只借模板的图层/样式，不要它的图形」。
+    [bool]$KeepBaseEntities = $true
 )
 
 Set-StrictMode -Version Latest
@@ -260,6 +272,51 @@ function Invoke-CadDrawSingle {
             New-Item -ItemType Directory -Force -Path $dwgDir | Out-Null
         }
 
+        # ── 4.5 模板底图 ─────────────────────────────────────────
+        # ★ 为什么要复制一份到工作目录 ★
+        #   accoreconsole /i 打开的是「原文件」，SAVEAS 又写回同一个路径时
+        #   AutoCAD 会报「图形正在使用中」。更糟的是：直接 /i 用户的原图，
+        #   一旦脚本中途 QUIT 时误应答了 _Y，模板就被写脏了。
+        #   所以先复制到 work/base.dwg，打开副本，SAVEAS 到 -Dwg。
+        #   用户的原模板字节级不变 —— 这一点下面会用哈希独立验证。
+        $baseWork = $null
+        $baseInfo = $null
+        $baseFull = $null
+        $baseHashBefore = $null
+        if ($BaseDwg) {
+            if (-not (Test-Path -LiteralPath $BaseDwg -PathType Leaf)) {
+                throw "模板底图不存在: $BaseDwg"
+            }
+            $baseFull = (Resolve-Path -LiteralPath $BaseDwg).Path
+            $baseInfo = Test-CadDwgFile -Path $baseFull
+            if (-not $baseInfo.valid) {
+                throw "模板底图不是有效 DWG: $($baseInfo.reason)"
+            }
+            $baseWork = Join-Path $work 'base.dwg'
+            Copy-Item -LiteralPath $baseFull -Destination $baseWork -Force
+            $baseHashBefore = (Get-FileHash -LiteralPath $baseFull -Algorithm SHA256).Hash
+
+            $checks.Add([pscustomobject]@{
+                name = "模板底图已载入（$(Split-Path -Leaf $baseFull) / $($baseInfo.version) / $([math]::Round((Get-Item -LiteralPath $baseFull).Length/1kb,1)) KB）"
+                pass = $true
+            }) | Out-Null
+            $evidence.Add((New-CadEvidence -Kind 'base-dwg' -Level 'known' `
+                -Message "以 $baseFull 为模板起图（DWG $($baseInfo.version)），几何追加在模板实体之上；模板文件本身不修改" `
+                -Value $baseFull -Source $baseFull)) | Out-Null
+        }
+
+        # SAVEAS 到已存在的文件会停在「此名称的图形已存在」等输入 →
+        # 脚本挂到超时。目标就是模板本身时更要拦，否则等于原地覆盖。
+        if ($baseWork -and $dwgPath -and (Test-Path -LiteralPath $dwgPath -PathType Leaf)) {
+            # ★ 输出路径不能等于模板路径 ★
+            #   模板模式下会先 Remove-Item 目标再 SAVEAS，如果目标就是模板，
+            #   用户的原图会被删掉 —— 这是不可逆的数据损坏，必须先拦。
+            if ([string]::Equals($dwgPath, $baseFull, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "输出 DWG 路径与模板底图相同（$dwgPath）。模板模式要求输出到另一个文件，否则会覆盖模板。"
+            }
+            Remove-Item -LiteralPath $dwgPath -Force
+        }
+
         $dxfPath = $null
         $dxfSpec = Get-CadField $saveSpec 'dxf'
         if ($dxfSpec) {
@@ -350,25 +407,47 @@ function Invoke-CadDrawSingle {
         }
 
         # ── 6. 生成 scr 并执行 ───────────────────────────────────
+        # ★ 顺序是硬约束，不是风格问题 ★
+        #   (load drawing.lsp) 一旦执行，里面就是逐个实体函数调用 —— 画完了。
+        #   所以「清空模板实体」必须排在 load 之前；而 c:BASELAYERS 是
+        #   cadcore 里定义的自定义命令，必须排在 load 之后。
+        #   两者方向相反，顺序颠倒任一个都会静默出错：
+        #     清空放到 load 之后 → 把刚画好的全删掉，最后得到空图
+        #     清图层放到 load 之前 → no function definition
         $scrPath = Join-Path $work 'draw.lsp.scr'
-        Write-CadScr -Path $scrPath -Lines @(
-            '(setvar "SECURELOAD" 0)',
-            '(setvar "FILEDIA" 0)',
-            '(setvar "CMDDIA" 0)',
-            '(setvar "CMDECHO" 0)',
-            '(setvar "OSMODE" 0)',
-            '(setvar "EXPERT" 5)',
-            "(load `"$(ConvertTo-CadPath $lspPath)`")",
-            # QUIT 之后可能还会问「是否保存对 xxx 的修改？」，不给应答就挂住。
-            # 多给几个 _N 兜底：多出来的空行对已退出的会话无害。
-            '_.QUIT',
-            '_N',
-            '_N',
-            '_N'
-        ) | Out-Null
+        $scrLines = New-Object System.Collections.Generic.List[string]
+        $scrLines.Add('(setvar "SECURELOAD" 0)')
+        $scrLines.Add('(setvar "FILEDIA" 0)')
+        $scrLines.Add('(setvar "CMDDIA" 0)')
+        $scrLines.Add('(setvar "CMDECHO" 0)')
+        $scrLines.Add('(setvar "OSMODE" 0)')
+        $scrLines.Add('(setvar "EXPERT" 5)')
+
+        if ($baseWork -and -not $KeepBaseEntities) {
+            # 原生 ERASE，不依赖 cadcore —— 必须在 load 之前
+            $scrLines.Add('(command "_.ERASE" "_ALL" "")')
+        }
+
+        $scrLines.Add("(load `"$(ConvertTo-CadPath $lspPath)`")")
+
+        if ($baseWork -and $KeepBaseLayers -and @($KeepBaseLayers).Count -gt 0) {
+            # 只删「清单外图层」上的模板实体；新实体画在清单内图层，不受影响
+            $keepList = ($KeepBaseLayers | ForEach-Object { '"' + ($_ -replace '"', '') + '"' }) -join ' '
+            $scrLines.Add("(c:BASELAYERS (list $keepList))")
+        }
+
+        # QUIT 之后可能还会问「是否保存对 xxx 的修改？」，不给应答就挂住。
+        # 多给几个 _N 兜底：多出来的空行对已退出的会话无害。
+        $scrLines.Add('_.QUIT')
+        $scrLines.Add('_N')
+        $scrLines.Add('_N')
+        $scrLines.Add('_N')
+
+        Write-CadScr -Path $scrPath -Lines $scrLines.ToArray() | Out-Null
 
         $run = Invoke-CadCoreConsole -AccoreConsole $accore `
-            -Script $scrPath -WorkingDirectory $work -TimeoutSeconds $TimeoutSeconds
+            -Script $scrPath -WorkingDirectory $work -TimeoutSeconds $TimeoutSeconds `
+            -InputDwg $baseWork
 
         $checks.Add([pscustomobject]@{
             name = "accoreconsole 退出码 $($run.exitCode) ($($run.exitName))"
@@ -515,6 +594,31 @@ function Invoke-CadDrawSingle {
                 } else {
                     $warnings.Add($uc.evidence.message)
                 }
+            }
+        }
+
+        # ── 7.5 模板底图的完整性校验 ─────────────────────────────
+        # ★ 为什么要事后验一遍 ★
+        #   模板模式最怕的不是画错，是「画对了但把模板写脏了」。
+        #   用户的原模板是长期资产，被脚本改一次就再也回不去。
+        #   这里用 SHA256 前后对比，是唯一能证明「没动过」的证据。
+        if ($baseFull) {
+            $baseHashAfter = (Get-FileHash -LiteralPath $baseFull -Algorithm SHA256).Hash
+            $unchanged = ($baseHashBefore -eq $baseHashAfter)
+            $checks.Add([pscustomobject]@{
+                name   = if ($unchanged) { '模板底图未被修改（SHA256 一致）' }
+                         else { '模板底图被改动了（SHA256 变化）' }
+                pass   = $unchanged
+                scope  = 'verdict'
+                detail = if ($unchanged) { '' } else { "运行前 $($baseHashBefore.Substring(0,16))… → 运行后 $($baseHashAfter.Substring(0,16))…" }
+            }) | Out-Null
+            $report.baseDwg = [pscustomobject]@{
+                path      = $baseFull
+                version   = $baseInfo.version
+                bytes     = (Get-Item -LiteralPath $baseFull).Length
+                unchanged = $unchanged
+                keepBaseEntities = $KeepBaseEntities
+                keptLayers = @($KeepBaseLayers)
             }
         }
 

@@ -505,6 +505,190 @@ function Get-CadBlobConvexHull {
 }
 
 # ══════════════════════════════════════════════════════════════════
+#  三·五、文字区域检测（不依赖 OCR）
+# ══════════════════════════════════════════════════════════════════
+
+function Find-CadTextRegions {
+    <#
+      从连通域里挑出「像文字」的，按行聚成文字块。
+
+      ★ 这一层完全不依赖 OCR ★
+        只靠几何特征判断「这块像不像字」，不需要任何引擎。所以即使
+        本机没有 OCR 语言包，也能给出「这里有一行字、大概多高、多宽、
+        几个字符」—— 足以让 CAD 里建一个 TEXT 占位符并标出来。
+
+      ★ 判据（三条，都是经验值）★
+        1. 字高 8–60px：低于 8 是噪点，高于 60 多半是图框或大标题
+        2. 字宽 1–60px、宽高比 ≤ 4：中文方块字接近 1:1，字母略窄；
+           比例超过 4 的细长块是线，不是字
+        3. 填充率 0.08–0.85：字有笔画空隙，实心块（填充区域）不是字
+
+      ★ 为什么要按行聚合 ★
+        单个字符 blob 拿去 OCR 几乎必然失败（引擎需要上下文）。而
+        「同一基线上的一串字符」才是 OCR 能处理的最小单位。所以先按
+        y 中心聚类成行，再按 x 间距切成文字段。
+
+      返回 @{ regions[]; charBlobs[]; warnings[] }
+        regions[] 每个 @{ id; x; y; w; h; charCount; estHeight; gap }
+    #>
+    param(
+        [Parameter(Mandatory)]$Blobs,
+        [int]$MinCharHeight = 8,
+        [int]$MaxCharHeight = 60,
+        [int]$MinCharWidth = 1,
+        [int]$MaxCharWidth = 60,
+        [double]$MaxAspect = 4.0,
+        [double]$MinFill = 0.08,
+        [double]$MaxFill = 0.85,
+        # 行内字间距超过「平均字宽 × 这个倍数」就切成两段
+        [double]$RunGapFactor = 2.0,
+        # 同一行判定的 y 中心容差（相对字高）
+        [double]$RowTolerance = 0.6
+    )
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    # ── 1. 挑字符候选 ──
+    $chars = New-Object System.Collections.Generic.List[object]
+    foreach ($b in @($Blobs)) {
+        if ($null -eq $b) { continue }
+        # ★ blob.width 是「掩码宽度」，不是连通域宽度 ★
+        #   Get-CadMaskBlobs 把 width 定义为掩码宽（因为 pixels 存的是
+        #   y*w+x 扁平下标）。连通域的包围盒宽高只能由 min/max 算：
+        #   w = maxX-minX+1，h = maxY-minY+1（闭区间像素）。
+        #   早先误用 $b.width 当域宽，StrictMode 下读 $b.height 直接抛
+        #   PropertyNotFoundStrict —— 这个坑记在这里。
+        $bw = [int]$b.maxX - [int]$b.minX + 1
+        $bh = [int]$b.maxY - [int]$b.minY + 1
+        if ($bw -le 0 -or $bh -le 0) { continue }
+        if ($bw -lt $MinCharWidth -or $bw -gt $MaxCharWidth) { continue }
+        if ($bh -lt $MinCharHeight -or $bh -gt $MaxCharHeight) { continue }
+
+        $aspect = if ($bh -gt 0) { $bw / [double]$bh } else { 999 }
+        if ($aspect -gt $MaxAspect) { continue }
+
+        $fill = if ($bw * $bh -gt 0) { $b.area / [double]($bw * $bh) } else { 0 }
+        if ($fill -lt $MinFill -or $fill -gt $MaxFill) { continue }
+
+        $chars.Add([pscustomobject]@{
+            blobId = $b.id
+            x = [int]$b.minX; y = [int]$b.minY
+            w = $bw; h = $bh
+            area = [int]$b.area
+            fill = [math]::Round($fill, 3)
+            cx = [double]$b.minX + $bw / 2.0
+            cy = [double]$b.minY + $bh / 2.0
+        })
+    }
+
+    if ($chars.Count -eq 0) {
+        return [pscustomobject]@{
+            regions = @(); charBlobs = @(); warnings = $warnings.ToArray()
+        }
+    }
+
+    # ── 2. 按 y 中心聚成行 ──
+    $sorted = @($chars | Sort-Object cy)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $sorted) {
+        $placed = $false
+        foreach ($row in $rows) {
+            $tol = [math]::Max($c.h, $row.refH) * $RowTolerance
+            if ([math]::Abs($c.cy - $row.cy) -le $tol) {
+                $row.items.Add($c)
+                # 行 y 中心与参考字高取累计平均，避免行越聚越偏
+                $n = $row.items.Count
+                $row.cy = (($row.cy * ($n - 1)) + $c.cy) / $n
+                if ($c.h -gt $row.refH) { $row.refH = $c.h }
+                $placed = $true
+                break
+            }
+        }
+        if (-not $placed) {
+            $items = New-Object System.Collections.Generic.List[object]
+            $items.Add($c)
+            $rows.Add([pscustomobject]@{ cy = $c.cy; refH = $c.h; items = $items })
+        }
+    }
+
+    # ── 3. 行内按 x 间距切文字段 ──
+    #   ★ 这里刻意不用 scriptblock 闭包 ★
+    #     上一版把「切段」写成 $flush = {...}.GetNewClosure()，结果闭包
+    #     在定义时就把 $run 快照住了，后面往里 Add 的元素闭包看不见，
+    #     每段都只切出第一个字符。改成把切段逻辑写成函数、显式传参，
+    #     没有隐式状态就没有这个坑。
+    $regions = New-Object System.Collections.Generic.List[object]
+    $rid = 0
+
+    $emitRun = {
+        param($RunItems, $Gap, [ref]$Counter, $Sink)
+        if ($RunItems.Count -eq 0) { return }
+        $x0 = [int]::MaxValue; $y0 = [int]::MaxValue
+        $x1 = -1; $y1 = -1
+        $hSum = 0.0
+        foreach ($it in $RunItems) {
+            if ($it.x -lt $x0) { $x0 = $it.x }
+            if ($it.y -lt $y0) { $y0 = $it.y }
+            if (($it.x + $it.w) -gt $x1) { $x1 = $it.x + $it.w }
+            if (($it.y + $it.h) -gt $y1) { $y1 = $it.y + $it.h }
+            $hSum += $it.h
+        }
+        $Counter.Value++
+        $Sink.Add([pscustomobject]@{
+            id        = "T$($Counter.Value)"
+            x         = $x0
+            y         = $y0
+            w         = ($x1 - $x0)
+            h         = ($y1 - $y0)
+            charCount = $RunItems.Count
+            estHeight = [math]::Round(($hSum / $RunItems.Count), 1)
+            gap       = [math]::Round($Gap, 1)
+        }) | Out-Null
+    }
+
+    foreach ($row in $rows) {
+        $ordered = @($row.items | Sort-Object x)
+        if ($ordered.Count -eq 0) { continue }
+
+        $avgW = ($ordered | Measure-Object -Property w -Average).Average
+        if ($avgW -le 0) { $avgW = 1 }
+        $gapLimit = $avgW * $RunGapFactor
+
+        $run = New-Object System.Collections.Generic.List[object]
+        $prevRight = $null
+        $runGap = 0.0
+
+        foreach ($c in $ordered) {
+            if ($null -ne $prevRight) {
+                $gap = $c.x - $prevRight
+                if ($gap -gt $gapLimit) {
+                    $runGap = $gap
+                    & $emitRun $run $runGap ([ref]$rid) $regions
+                    $run = New-Object System.Collections.Generic.List[object]
+                    $runGap = 0.0
+                }
+            }
+            $run.Add($c)
+            $prevRight = $c.x + $c.w
+        }
+        & $emitRun $run 0 ([ref]$rid) $regions
+    }
+
+    # 单字符段多半是噪声或孤立符号，留着会让下游 OCR 白跑一遍
+    $kept = @($regions | Where-Object { $_.charCount -ge 2 })
+    $dropped = $regions.Count - $kept.Count
+    if ($dropped -gt 0) {
+        $warnings.Add("丢弃 $dropped 个单字符文字段（孤立的单个笔画多为噪点或符号）")
+    }
+
+    return [pscustomobject]@{
+        regions   = $kept
+        charBlobs = $chars.ToArray()
+        warnings  = $warnings.ToArray()
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════
 #  四、整图入口：掩码 → blob → 分类 → 候选几何
 # ══════════════════════════════════════════════════════════════════
 
@@ -536,7 +720,18 @@ function Find-CadImageGeometry {
         [int]$MaxResults = 200,
         [double]$CircleRadialDev = 0.15,
         [int]$CircleMinSectors = 30,
-        [double]$LineElongation = 4.0
+        [double]$LineElongation = 4.0,
+        # ── 文字 ──
+        # 默认开着：文字区域检测不依赖 OCR，纯几何判断，代价很低。
+        # 关掉它才会出现「图里明明有字，输出里一个字都没有」的老问题。
+        [switch]$DetectText = $true,
+        # OCR 默认关：慢（每段要裁图+放大+识别），而且本机实测在低分辨率
+        # 工程图上识别率极低。需要文字内容时显式打开，并接受 inferred 级证据。
+        [switch]$Ocr,
+        [string]$OcrLanguage = 'zh-Hans-CN',
+        [int]$OcrUpscale = 3,
+        [int]$MinTextCharHeight = 8,
+        [int]$MaxTextCharHeight = 60
     )
 
     $warnings = New-Object System.Collections.Generic.List[string]
@@ -554,6 +749,7 @@ function Find-CadImageGeometry {
             width = $mask.width; height = $mask.height
             darkIsInk = $mask.darkIsInk; inkCount = 0; inkRatio = 0.0
             bounds = $null; circles = @(); lines = @(); polygons = @()
+            textRegions = @(); textDetection = $null
             blobs = @(); evidence = $evidence.ToArray(); warnings = $warnings.ToArray()
         }
     }
@@ -561,10 +757,95 @@ function Find-CadImageGeometry {
     $blobs = Get-CadMaskBlobs -Mask $mask -MinArea $MinBlobArea
     $skipped = 0
 
+    # ── 文字区域检测 ──
+    # ★ 必须在几何分类之前跑 ★
+    #   文字笔画也会被当成「线」或「多边形」收进 circles/lines/polygons。
+    #   先算出文字区域，后面就能把落在文字区域里的实体剔掉，避免一张
+    #   图上几十个字符笔画全变成 IMAGE_LINE 垃圾线。
+    $textRegions = @()
+    $textDetection = $null
+    if ($DetectText) {
+        try {
+            $td = Find-CadTextRegions -Blobs $blobs `
+                -MinCharHeight $MinTextCharHeight -MaxCharHeight $MaxTextCharHeight
+            $textRegions = @($td.regions)
+            foreach ($w in $td.warnings) { $warnings.Add($w) }
+
+            $textDetection = [ordered]@{
+                available   = $true
+                regions     = $textRegions.Count
+                charBlobs   = @($td.charBlobs).Count
+                ocr         = $false
+                ocrLanguage = $null
+                ocrOk       = 0
+                ocrFailed   = 0
+            }
+
+            # ── 可选：OCR 出文字内容 ──
+            if ($Ocr -and $textRegions.Count -gt 0) {
+                if (-not (Get-Command Invoke-CadOcrRegions -ErrorAction SilentlyContinue)) {
+                    . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'CadOcr.ps1')
+                }
+                $ocrOut = Invoke-CadOcrRegions -ImagePath $Path -Regions $textRegions `
+                    -Language $OcrLanguage -Upscale $OcrUpscale
+
+                $textDetection.ocr = [bool]$ocrOut.available
+                $textDetection.ocrLanguage = $ocrOut.language
+                if (-not $ocrOut.available) {
+                    $warnings.Add("OCR 不可用，只给了文字区域没有文字内容：$($ocrOut.error)")
+                } else {
+                    $byId = @{}
+                    foreach ($r in @($ocrOut.results)) { $byId[[string]$r.id] = $r }
+                    foreach ($tr in $textRegions) {
+                        $hit = $byId[[string]$tr.id]
+                        if ($null -ne $hit -and $hit.ok) {
+                            $tr | Add-Member -NotePropertyName text -NotePropertyValue ([string]$hit.text) -Force
+                            if ($hit.text) { $textDetection.ocrOk++ } else { $textDetection.ocrFailed++ }
+                        } else {
+                            $tr | Add-Member -NotePropertyName text -NotePropertyValue '' -Force
+                            $textDetection.ocrFailed++
+                        }
+                    }
+                    if ($textDetection.ocrOk -eq 0) {
+                        $warnings.Add("OCR 跑通了但一个字都没认出来（$($textRegions.Count) 个文字段全部失败）。低分辨率扫描图常见；文字区域坐标仍然可用，内容请人工填。")
+                    } elseif ($textDetection.ocrOk -lt $textRegions.Count) {
+                        $warnings.Add("OCR 只认出 $($textDetection.ocrOk)/$($textRegions.Count) 个文字段，其余为空。OCR 结果一律 inferred 级，必须人工核对。")
+                    }
+                }
+            }
+        } catch {
+            $warnings.Add("文字区域检测失败（不影响几何）：$($_.Exception.Message)")
+            $textDetection = [ordered]@{ available = $false; regions = 0; charBlobs = 0; ocr = $false; error = $_.Exception.Message }
+        }
+    }
+
+    # 文字区域覆盖判定：实体中心落在某个文字区域内就视为文字笔画
+    $inTextRegion = {
+        param($Cx, $Cy)
+        foreach ($tr in $textRegions) {
+            if ($Cx -ge $tr.x -and $Cx -le ($tr.x + $tr.w) -and
+                $Cy -ge $tr.y -and $Cy -le ($tr.y + $tr.h)) { return $true }
+        }
+        return $false
+    }
+    $textStrokes = 0
+
     foreach ($b in $blobs) {
         if (($circles.Count + $lines.Count + $polys.Count) -ge $MaxResults) {
             $skipped++
             continue
+        }
+
+        # ★ 落在文字区域里的连通域是笔画，不是几何 ★
+        #   不剔掉的话，一行「三相电动机」会变成十几个 IMAGE_LINE，
+        #   把真正的线埋掉，还会让人以为图里有大量短线段。
+        if ($textRegions.Count -gt 0) {
+            $bcx = ([int]$b.minX + [int]$b.maxX) / 2.0
+            $bcy = ([int]$b.minY + [int]$b.maxY) / 2.0
+            if (& $inTextRegion $bcx $bcy) {
+                $textStrokes++
+                continue
+            }
         }
 
         $c = Get-CadBlobCircleFit -Blob $b -MaxRadialDevRatio $CircleRadialDev -MinSectors $CircleMinSectors
@@ -599,7 +880,12 @@ function Find-CadImageGeometry {
             continue
         }
 
-        $hull = Get-CadBlobConvexHull -Blob $b
+        # ★ 凸包可能是空的 ★
+        #   Get-CadBlobConvexHull 内部 return @()，而 PowerShell 的管道
+        #   语义会把这个空数组压成 $null 返回给调用方。StrictMode Latest
+        #   下 $null.Count 直接抛 PropertyNotFoundStrict —— 不是「返回 0」
+        #   而是整张图解析崩掉。所以必须先判空再取 Count。
+        $hull = @(Get-CadBlobConvexHull -Blob $b)
         if ($hull.Count -ge 3) {
             $polys.Add([pscustomobject]@{
                 kind      = 'polygon'
@@ -620,26 +906,37 @@ function Find-CadImageGeometry {
         -Message "分类结果：圆 $($circles.Count) / 线 $($lines.Count) / 未识别 $($polys.Count)（共 $($blobs.Count) 个连通域 ≥$MinBlobArea px）" `
         -Value ($circles.Count + $lines.Count) -Source $Path))
 
+    if ($null -ne $textDetection -and $textDetection.available) {
+        $evidence.Add((New-CadEvidence -Kind 'image-text-region' -Level 'known' `
+            -Message "文字区域 $($textRegions.Count) 段（$($textDetection.charBlobs) 个字符笔画），剔除落在其中的 $textStrokes 个连通域；文字内容 $(if ($textDetection.ocr) { "OCR 认出 $($textDetection.ocrOk)/$($textRegions.Count)" } else { '未做 OCR（只给位置）' })" `
+            -Value $textRegions.Count -Source $Path))
+    }
+
     if ($skipped -gt 0) {
         $warnings.Add("达到上限 $MaxResults，还有 $skipped 个连通域未处理；图可能太碎（噪点多）或该先裁掉空白边")
     }
     if ($polys.Count -gt $circles.Count + $lines.Count -and $polys.Count -gt 3) {
         $warnings.Add("未识别域（$($polys.Count)）多于已识别几何 —— 这份图多半不是干净线稿，或文字/剖面线太多；先看图再写 spec")
     }
+    if ($textStrokes -gt 0) {
+        $warnings.Add("有 $textStrokes 个连通域被判定为文字笔画并从几何里剔除；它们的位置在 textRegions 里，内容需要人工填或开 -Ocr")
+    }
 
     return [pscustomobject]@{
-        width      = $mask.width
-        height     = $mask.height
-        darkIsInk  = $mask.darkIsInk
-        inkCount   = $mask.inkCount
-        inkRatio   = $mask.inkRatio
-        bounds     = $mask.bounds
-        circles    = $circles.ToArray()
-        lines      = $lines.ToArray()
-        polygons   = $polys.ToArray()
-        blobs      = $blobs
-        evidence   = $evidence.ToArray()
-        warnings   = $warnings.ToArray()
+        width         = $mask.width
+        height        = $mask.height
+        darkIsInk     = $mask.darkIsInk
+        inkCount      = $mask.inkCount
+        inkRatio      = $mask.inkRatio
+        bounds        = $mask.bounds
+        circles       = $circles.ToArray()
+        lines         = $lines.ToArray()
+        polygons      = $polys.ToArray()
+        textRegions   = @($textRegions)
+        textDetection = $textDetection
+        blobs         = $blobs
+        evidence      = $evidence.ToArray()
+        warnings      = $warnings.ToArray()
     }
 }
 
@@ -671,8 +968,11 @@ function Convert-CadImageGeometryToSpec {
         [string]$CircleLayer = 'IMAGE_CIRCLE',
         [string]$LineLayer = 'IMAGE_LINE',
         [string]$PolyLayer = 'IMAGE_POLY',
+        [string]$TextLayer = 'IMAGE_TEXT',
         [int]$MaxPolyPoints = 24,
-        [switch]$IncludePolygons
+        [switch]$IncludePolygons,
+        # 文字实体默认输出（有 textRegions 就出），关掉会丢字
+        [switch]$SkipText = $false
     )
 
     $warnings = New-Object System.Collections.Generic.List[string]
@@ -747,6 +1047,53 @@ function Convert-CadImageGeometryToSpec {
         }
     }
 
+    # ── 文字 ──
+    # ★ 有 OCR 文字就写文字，没有就写「占位符」★
+    #   占位符不是糊弄：CAD 里能看到「这里该有一行字、多高、多长」，
+    #   比什么都没有强得多 —— 什么都不知道的图是没法照着画的。
+    #   占位符内容用 § 包住，一眼能认出是待填。
+    $textCount = 0
+    if (-not $SkipText) {
+        foreach ($tr in @($Geometry.textRegions)) {
+            if ($null -eq $tr) { continue }
+
+            # 文字基点在左下角；像素 y 是顶边，要加上字高再翻 Y
+            $tx = [math]::Round([double]$tr.x * $s, 4)
+            $ty = (& $flipY ([double]$tr.y + [double]$tr.h))
+            $th = [math]::Round([double]$tr.estHeight * $s, 4)
+            if ($th -le 0) { $th = [math]::Round(2.5 * $s, 4) }
+
+            $raw = ''
+            if ($tr.PSObject.Properties['text']) { $raw = [string]$tr.text }
+            $hasText = -not [string]::IsNullOrWhiteSpace($raw)
+            $content = if ($hasText) { $raw } else { "§$($tr.id) 文字 $($tr.charCount)字§" }
+
+            $entities.Add([ordered]@{
+                type   = 'text'
+                layer  = $TextLayer
+                at     = @($tx, $ty)
+                height = $th
+                value  = $content
+                _src   = if ($hasText) {
+                            "image-text $($tr.id)：$($tr.charCount) 个字符笔画，OCR 结果（inferred，必须人工核对）"
+                         } else {
+                            "image-text $($tr.id)：$($tr.charCount) 个字符笔画，位置/高度为 known，**内容未识别**，§ 内为占位待填"
+                         }
+            })
+            $textCount++
+        }
+        if ($textCount -gt 0) {
+            $noText = @($Geometry.textRegions | Where-Object {
+                -not ($_.PSObject.Properties['text'] -and -not [string]::IsNullOrWhiteSpace([string]$_.text))
+            }).Count
+            if ($noText -gt 0) {
+                $warnings.Add("$noText 段文字只有位置没有内容（§…§ 占位符），照着画时必须人工读出原文再替换")
+            }
+        }
+    } elseif (@($Geometry.textRegions).Count -gt 0) {
+        $warnings.Add("文字区域有 $(@($Geometry.textRegions).Count) 段但被 -SkipText 丢掉了；图里的字不会出现在 DXF 里")
+    }
+
     $spec = [ordered]@{
         name   = 'image-trace'
         units  = 'mm'
@@ -754,6 +1101,7 @@ function Convert-CadImageGeometryToSpec {
             [ordered]@{ name = $CircleLayer; color = 1 }
             [ordered]@{ name = $LineLayer;   color = 3 }
             [ordered]@{ name = $PolyLayer;   color = 8 }
+            [ordered]@{ name = $TextLayer;   color = 2 }
         )
         entities = @($entities.ToArray())
     }
@@ -761,7 +1109,7 @@ function Convert-CadImageGeometryToSpec {
     return [pscustomobject]@{
         spec     = $spec
         scale    = [math]::Round($s, 6)
-        counts   = [pscustomobject]@{ circles = @($Geometry.circles).Count; lines = @($Geometry.lines).Count; polygons = @($Geometry.polygons).Count }
+        counts   = [pscustomobject]@{ circles = @($Geometry.circles).Count; lines = @($Geometry.lines).Count; polygons = @($Geometry.polygons).Count; texts = $textCount }
         warnings = $warnings.ToArray()
     }
 }

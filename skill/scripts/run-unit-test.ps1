@@ -1352,6 +1352,141 @@ $cb = [IO.File]::ReadAllBytes((Join-Path $scriptRoot 'Invoke-CadRenderPreview.ps
 if ($cb.Length -ge 3 -and $cb[0] -eq 0xEF -and $cb[1] -eq 0xBB -and $cb[2] -eq 0xBF) { $cliBom = $true }
 Check 'Invoke-CadRenderPreview.ps1 带 UTF-8 BOM' $cliBom ''
 
+# ══════════════════════════════════════════════════════════════════
+Section '26. 文字检测：几何判据 + 行聚合 + 字号边界'
+# ══════════════════════════════════════════════════════════════════
+# 这一节全部用「手工构造的 blob」当输入，不读图片、不启动 CAD。
+# 目的是把 Find-CadTextRegions 的判据钉死：以后谁调阈值、谁改聚合逻辑，
+# 这三条一红就说明「文字检测」这条链路被动了。
+
+# 26.1 判据：字高、宽高比、填充率三条筛选
+#   造 4 个 blob：合格字符、太矮、太扁（宽高比超限）、实心块（填充率超限）
+$mkBlob = {
+    param($id, $x, $y, $w, $h, $area)
+    [pscustomobject]@{
+        id = $id; minX = $x; minY = $y; maxX = ($x + $w - 1); maxY = ($y + $h - 1)
+        area = $area; width = $w; height = $h; pixels = @()
+    }
+}
+$blobOk      = & $mkBlob 1 10 10 12 14 60      # 12x14, fill=60/168=0.357 → 合格
+$blobShort   = & $mkBlob 2 30 10 10 5  20      # 高 5 < MinCharHeight 8 → 排除
+$blobFlat    = & $mkBlob 3 50 10 60 12 120     # 宽高比 5.0 > 4.0 → 排除
+$blobSolid   = & $mkBlob 4 120 10 12 14 160    # fill=160/168=0.952 > 0.85 → 排除
+$td1 = Find-CadTextRegions -Blobs @($blobOk, $blobShort, $blobFlat, $blobSolid)
+Check '文字判据：只保留合格字符' (@($td1.charBlobs).Count -eq 1) "charBlobs=$(@($td1.charBlobs).Count)，期望 1"
+# ★ 只剩 1 个字符时 regions 也是 0 —— 下游刻意丢掉单字符段
+#   （孤立笔画多为噪点或符号）。所以这里期望 0 段 + 一条丢弃 warning。
+Check '文字判据：单字符段被下游丢弃' (@($td1.regions).Count -eq 0) `
+    "regions=$(@($td1.regions).Count)，期望 0（单字符段丢弃）"
+Check '文字判据：丢弃单字符段时有 warning' `
+    ((@($td1.warnings) -join ' ') -match '单字符') `
+    (@($td1.warnings) -join ' | ')
+
+# 26.2 行聚合：同一基线上 5 个字符 → 1 段，charCount=5
+$row = @()
+for ($i = 0; $i -lt 5; $i++) {
+    $row += & $mkBlob (10 + $i) (10 + $i * 14) 40 12 14 60
+}
+$td2 = Find-CadTextRegions -Blobs $row
+Check '行聚合：5 字符同一行 → 1 段' (@($td2.regions).Count -eq 1) "regions=$(@($td2.regions).Count)"
+Check '行聚合：charCount 正确' (@($td2.regions)[0].charCount -eq 5) "charCount=$(@($td2.regions)[0].charCount)，期望 5"
+
+# 26.3 行切分：间距超限必须断成两段，不能糊成一段
+#   前 3 个字紧挨（间距 1），后面两个跳到 +200 再紧挨。
+#   ★ 断出来的两段都必须是 ≥2 个字符 ★
+#   否则单字符段会被下游当噪点丢掉，测出来的「1 段」是丢弃造成的，
+#   不是「没断开」，那样这条断言就测错了对象。
+$gap = @(
+    (& $mkBlob 21 10  40 12 14 60),
+    (& $mkBlob 22 23  40 12 14 60),
+    (& $mkBlob 23 36  40 12 14 60),
+    (& $mkBlob 24 236 40 12 14 60),
+    (& $mkBlob 25 249 40 12 14 60)
+)
+$td3 = Find-CadTextRegions -Blobs $gap
+Check '行切分：大间距断成 2 段' (@($td3.regions).Count -eq 2) "regions=$(@($td3.regions).Count)，期望 2"
+Check '行切分：两段字符数分别为 3 与 2' `
+    ((@($td3.regions | Sort-Object x | ForEach-Object { $_.charCount })) -join ',' -eq '3,2') `
+    ("charCount=" + ((@($td3.regions | Sort-Object x | ForEach-Object { $_.charCount })) -join ','))
+
+# 26.4 空输入：不能抛异常，返回空结果
+$td4 = Find-CadTextRegions -Blobs @()
+Check '空输入：返回空 regions 不抛异常' (@($td4.regions).Count -eq 0 -and @($td4.charBlobs).Count -eq 0) ''
+
+# 26.5 端到端：合成一张「已知答案」的图，验证检测出来的位置/字高对得上
+#   不依赖本机字体渲染细节的精确像素，只验证「该有几段、大概在哪、字高数量级」
+$synDir = Join-Path $work 'synthetic-text'
+New-Item -ItemType Directory -Path $synDir -Force | Out-Null
+$synImg = Join-Path $synDir 'three-lines.png'
+$canDraw = $true
+try {
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    $bmp = New-Object System.Drawing.Bitmap 900, 300
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::White)
+    $g.SmoothingMode = 'AntiAlias'
+    $g.TextRenderingHint = 'AntiAliasGridFit'
+    $f = New-Object System.Drawing.Font('Microsoft YaHei', 32.0, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $g.DrawString('KM1 QF1 M1', $f, [System.Drawing.Brushes]::Black, 40.0, 40.0)
+    $g.DrawString('L1 L2 L3 PE', $f, [System.Drawing.Brushes]::Black, 40.0, 120.0)
+    $g.DrawString('三相电动机', $f, [System.Drawing.Brushes]::Black, 40.0, 200.0)
+    $g.Dispose(); $bmp.Save($synImg, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+} catch { $canDraw = $false }
+if ($canDraw) {
+    $geo = Find-CadImageGeometry -Path $synImg -DetectText
+    $regs = @($geo.textRegions)
+    Check '合成图端到端：检出 3 行文字' ($regs.Count -eq 3) "regions=$($regs.Count)，期望 3"
+    if ($regs.Count -eq 3) {
+        $ys = @($regs | Sort-Object y | ForEach-Object { $_.y })
+        $monotonic = ($ys[0] -lt $ys[1]) -and ($ys[1] -lt $ys[2])
+        Check '合成图端到端：三行自上而下排列' $monotonic ("y=" + ($ys -join ','))
+        $heights = @($regs | ForEach-Object { $_.estHeight })
+        $hOk = ($heights | Where-Object { $_ -ge 15 -and $_ -le 40 }).Count -eq 3
+        Check '合成图端到端：字高落在 15–40px' $hOk ("estH=" + ($heights -join ','))
+        # 中文行的起点会比西文行靠右（字形左空隙不同），所以放宽到 30–90
+        $leftOk = ($regs | Where-Object { $_.x -ge 30 -and $_.x -le 90 }).Count -eq 3
+        Check '合成图端到端：左边距落在 30–90px' $leftOk ("x=" + ((@($regs | ForEach-Object { $_.x })) -join ','))
+    }
+} else {
+    Check '合成图端到端：System.Drawing 可用' $false '本机无法创建位图，跳过端到端'
+}
+
+# 26.6 转 spec：文字区域必须变成 type=text 实体，且带 at/height
+$tdSpec = Convert-CadImageGeometryToSpec -Geometry $geo -Scale 1.0
+$textEnts = @($tdSpec.spec.entities | Where-Object { $_.type -eq 'text' })
+Check '转 spec：文字区域变成 text 实体' ($textEnts.Count -eq 3) "text 实体=$($textEnts.Count)，期望 3"
+Check '转 spec：text 实体带 at 与 height' `
+    (@($textEnts | Where-Object { $null -ne $_.at -and $_.height -gt 0 }).Count -eq 3) ''
+
+# ══════════════════════════════════════════════════════════════════
+Section '27. 模板底图：参数契约 + 铁律静态断言'
+# ══════════════════════════════════════════════════════════════════
+# 模板底图（-BaseDwg）一旦写错，最坏的后果是「把用户的模板 dwg 改坏」。
+# 所以这里除了参数存在性，还要静态断言三条铁律真的写进了源码。
+
+$drawTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'Invoke-CadDraw.ps1') -Raw
+Check 'BaseDwg：参数存在' ($drawTxt -match '\$BaseDwg') ''
+Check 'BaseDwg：KeepBaseEntities 参数存在（默认 true）' ($drawTxt -match '\$KeepBaseEntities\s*=\s*\$true') ''
+Check 'BaseDwg：KeepBaseLayers 参数存在' ($drawTxt -match '\$KeepBaseLayers') ''
+
+# 铁律 1：必须复制到工作副本再画，绝不直接开模板
+#   实际写法是 Copy-Item -LiteralPath $baseFull -Destination $baseWork
+Check 'BaseDwg 铁律：先复制出工作副本再画' `
+    ($drawTxt -match 'Copy-Item[^\r\n]*-Destination\s+\$baseWork') `
+    '期望 Copy-Item ... -Destination $baseWork'
+# 铁律 2：模板 SHA256 必须前后比对（证明没被改）
+Check 'BaseDwg 铁律：SHA256 前后比对' ($drawTxt -match 'Get-FileHash' -and $drawTxt -match 'unchanged') ''
+# 铁律 3：不保留底图实体时必须走 ERASE 全清
+Check 'BaseDwg 铁律：KeepBaseEntities=false 走清空' ($drawTxt -match 'ERASE|_E|all.*remove|ClearBaseEntities|EraseAll') ''
+
+# 静态断言：cadcore.lsp 里 2018 也必须走 _V 分支（不许抄近路）
+#   背景：曾为 2018 省掉 _V，结果本机 DXFOUT 默认输出 2013(AC1027)，
+#   请求 2018 却拿到 2013 格式，只有比文件头才发现。这条断言防回归。
+$coreTxt = Get-Content -LiteralPath (Join-Path $scriptRoot 'cadcore.lsp') -Raw -Encoding UTF8
+$hasVFor2018 = ($coreTxt -notmatch '=\s*\(strcase v\)\s*"2018"')
+Check 'SAVEDXF：2018 不再抄近路（必须走 _V）' $hasVFor2018 ''
+Check 'SAVEDXF：仍保留 _V 分支' ($coreTxt -match '"_V"\s+v\s+p') ''
+
 
 # ══════════════════════════════════════════════════════════════════
 #  汇总

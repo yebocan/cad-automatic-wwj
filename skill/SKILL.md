@@ -267,10 +267,40 @@ $dxf = Write-CadImageDxf -Geometry $geo -Output "out.dxf" -Scale 0.1
 
 **诚实边界（写进源码注释，不是免责声明，是能力声明）**：
 
-- 这是视觉矢量化不是语义理解：文字会被当成小墨点丢掉、齿轮变成一坨闭合多边形。产物是「候选几何」+ 证据分级（circle/line 是 `known`，polygons 是 `inferred` 需人工确认），**最终 spec 仍要人确认后再画**——从位图反推精确几何一定要确认，半径差 0.3mm 屏幕上一样、装到机器上就装不进。
-- 只输出 circle / line / polyline 三类，hatch/block/spline/gear 不猜——猜错比不猜更糟。
+- 这是视觉矢量化不是语义理解：齿轮变成一坨闭合多边形、圆角半径靠拟合估。产物是「候选几何」+ 证据分级（circle/line 是 `known`，polygons 是 `inferred` 需人工确认），**最终 spec 仍要人确认后再画**——从位图反推精确几何一定要确认，半径差 0.3mm 屏幕上一样、装到机器上就装不进。
+- 只输出 circle / line / polyline / text 四类，hatch/block/spline/gear 不猜——猜错比不猜更糟。
 - **Y 轴必须翻**：像素 y 向下增、图纸 y 向上增，不翻则上下颠倒且不报错。
 - `-Scale` 不给就按 1:1 并 warning「没有物理比例」；知道图里某条线实际长度时传 `-KnownWidth` 换算。
+
+### 文字识别（`-DetectText`）
+
+```powershell
+& "<skill>\scripts\Get-CadImageInfo.ps1" -Path "scan.png" -Action vectorize -Output "out.dxf" -DetectText -Ocr -AsJson
+```
+
+`-DetectText` 打开文字区域检测，**不依赖 OCR**：只靠几何特征判断「这块像不像字」，再按行聚成文字段。所以本机没装 OCR 语言包也能给出「这里有一行字、多高、多宽、几个字符」，用来在 CAD 里建 TEXT 占位符并标出位置。
+
+三条判据（都在 [CadVectorize.ps1](scripts/CadVectorize.ps1) 的 `Find-CadTextRegions`）：字高 8–60px（低于 8 是噪点、高于 60 多半是图框或大标题）、宽高比 ≤4（中文方块字近 1:1，超 4 的细长块是线）、填充率 0.08–0.85（字有笔画空隙，实心块是填充区域）。然后按 y 中心聚行（容差 = 字高×0.6），行内按 x 间距切段（超过平均字宽×2 就断开）。**单字符段会被丢掉**——孤立笔画多是噪点或符号，留着只会让下游 OCR 白跑。
+
+`-Ocr` 再进一步，用 Windows 自带 OCR 引擎把文字段读成内容（`Windows.Media.Ocr`，走 WinRT，无需 Python）。OCR 只吃位图，所以每段要从原图裁一块喂进去；引擎或语言包缺失时**不报错退出**，而是保留几何检测结果 + 写 warning「OCR 不可用，只给了位置没有内容」。
+
+**字号边界（实测，别指望更小）**：14px 起能稳定检出单行中文，10px 基本检不到（笔画被拆成碎块）；西文行比中文行好检（同一 px 下笔画更连贯）。扫描件要检测文字，DPI 别低于 200。
+
+### 模板底图（`-BaseDwg`）
+
+```powershell
+& "<skill>\scripts\Invoke-CadDraw.ps1" -SpecFile "spec.json" -BaseDwg "电气CAD.dwg" -OutputDir "out" -AsJson
+```
+
+以一张已有 DWG 为底图起图，新几何追加在模板实体之上——图框、标题栏、标准图例不用每次重画。参数：`-BaseDwg`（模板路径）、`-KeepBaseEntities`（默认 `$true`，`$false` 则先清空模板实体只留图层/样式）、`-KeepBaseLayers`（保留哪些模板图层，不填全留）。
+
+**三条铁律（源码里逐条实现，单元测试静态断言防回归）**：
+
+1. **绝不直接打开模板**：先 `Copy-Item` 到工作目录的 `base.dwg`，只对副本动手。用户的原模板字节级不变。
+2. **SHA256 前后比对**：报告里 `baseDwg.unchanged` 必须为 `$true`，否则说明模板被改过，直接判失败。
+3. **输出路径不能等于模板路径**：相等就抛错。模板模式会先 `Remove-Item` 目标再 SAVEAS，目标就是模板的话等于原地删掉用户原图——不可逆的数据损坏。
+
+`-KeepBaseEntities $false` 时走 `ERASE` 全清，适合「拿模板的图层/标注样式，但不要旧图形」。注意此时 DXF 实体数会与 spec 实体数一致；保留底图时 DXF 实体数 = 模板实体 + spec 实体，报告会有一条 warning 说明这个差额是正常的，不是画多了。
 
 ## DXF 预览渲染（不开 CAD）
 
